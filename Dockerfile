@@ -1,27 +1,37 @@
-# Start from a Debian image with the latest version of Go installed
-# and a workspace (GOPATH) configured at /go.
-ARG REGISTRY="docker.io/library"
-ARG BASE_IMAGE=golang
-ARG BASE_TAG=1.25-trixie
+# Build BigGrep exactly as in Retrohunt (autogen/configure/make),
+# using the source archive committed under third_party/.
+ARG REGISTRY=docker.io/library
+ARG GO_IMAGE=golang
+ARG GO_TAG=1.27-trixie
 
-FROM $REGISTRY/$BASE_IMAGE:$BASE_TAG AS builder
+FROM ${REGISTRY}/${GO_IMAGE}:${GO_TAG} AS builder
 ENV DEBIAN_FRONTEND=noninteractive
-ENV GOOS=linux GOARCH=amd64 CGO_ENABLED=0 GO111MODULE=on GOPATH=/src/tmp/go
-ENV GOPRIVATE=dev.azure.com
+ENV CGO_ENABLED=0 GOOS=linux GOARCH=amd64
+ENV GOPRIVATE=github.com/AustralianCyberSecurityCentre/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    autoconf automake libtool make g++ pkg-config unzip \
+    libboost-all-dev zlib1g-dev python3 && \
+    rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+# Uses the existing BigGrep archive; no network download for the C++ source.
+RUN make biggrep
+RUN --mount=type=ssh go build -trimpath -tags netgo -ldflags='-s -w' \
+    -o /out/azul-plugin-retroindexer .
+RUN install -Dm755 .build/bin/bgindex /out/bgindex
 
-ARG XDG_CONFIG_HOME
-
-RUN apt-get update && \
-    apt-get upgrade -y
-
-# copy somewhere outside GOPATH/src as using go modules
-COPY . /src
-
-# full static builds with no ld deps, so we can copy it to scratch
-RUN --mount=type=ssh,id=id cd /src && \
-    go build -v -a -tags netgo -ldflags '-w -extldflags "-static"' -o /go/bin/azul-plugin-retroindexer *.go
-
-# now copy artifacts to a lightweight image
-FROM $REGISTRY/alpine:latest
-COPY --from=builder /go/bin /bin
-ENTRYPOINT ["/bin/azul-plugin-retroindexer"]
+# BigGrep is a dynamically linked C++ executable, so scratch/alpine will not work.
+FROM ${REGISTRY}/debian:trixie-slim AS release
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libstdc++6 zlib1g \
+    libboost-thread-dev libboost-system-dev libboost-iostreams-dev \
+    libboost-date-time-dev libboost-chrono-dev libboost-timer-dev && \
+    rm -rf /var/lib/apt/lists/*
+COPY --from=builder /out/azul-plugin-retroindexer /usr/local/bin/azul-plugin-retroindexer
+COPY --from=builder /out/bgindex /usr/local/bin/bgindex
+ARG UID=21000
+ARG GID=21000
+RUN groupadd -g "$GID" azul && useradd -u "$UID" -g "$GID" -M azul
+USER azul
+ENTRYPOINT ["/usr/local/bin/azul-plugin-retroindexer"]
