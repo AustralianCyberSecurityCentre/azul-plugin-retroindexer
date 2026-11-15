@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	bedSet "github.com/AustralianCyberSecurityCentre/azul-bedrock/v13/gosrc/settings"
 )
 
 const MinDataSize = 4
@@ -103,7 +105,11 @@ func (p *Pipeline) AddStream(r io.Reader, m Metadata) (bool, error) {
 		return false, err
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
+	defer func() {
+		if err := os.Remove(tmpName); err != nil && !errors.Is(err, os.ErrNotExist) {
+			bedSet.Logger.Error().Err(err).Msg("failed to remove temporary file")
+		}
+	}()
 	h := sha256.New()
 	size, copyErr := io.Copy(io.MultiWriter(tmp, h), io.LimitReader(r, p.Config.MaxBytes+1))
 	closeErr := tmp.Close()
@@ -141,11 +147,17 @@ func (p *Pipeline) AddStream(r io.Reader, m Metadata) (bool, error) {
 	}
 	metaTmp, err := os.CreateTemp(p.cacheDir(), ".meta-")
 	if err != nil {
-		os.Remove(dest)
+		if removeErr := os.Remove(dest); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			bedSet.Logger.Error().Err(removeErr).Msg("failed to remove destination file")
+		}
 		return false, err
 	}
 	metaName := metaTmp.Name()
-	defer os.Remove(metaName)
+	defer func() {
+		if err := os.Remove(metaName); err != nil && !errors.Is(err, os.ErrNotExist) {
+			bedSet.Logger.Error().Err(err).Msg("failed to remove temporary metadata file")
+		}
+	}()
 	if _, err = metaTmp.Write(payload); err == nil {
 		err = metaTmp.Sync()
 	}
@@ -156,7 +168,9 @@ func (p *Pipeline) AddStream(r io.Reader, m Metadata) (bool, error) {
 		err = os.Rename(metaName, dest+metaSuffix)
 	}
 	if err != nil {
-		os.Remove(dest)
+		if removeErr := os.Remove(dest); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			bedSet.Logger.Error().Err(removeErr).Msg("failed to remove destination file")
+		}
 		return false, err
 	}
 	return true, nil
@@ -232,11 +246,17 @@ func (p *Pipeline) PeriodicCopy() error {
 		return err
 	}
 	staging := filepath.Join(p.stateDir(), "periodic-stash")
-	os.RemoveAll(staging)
+	if err := os.RemoveAll(staging); err != nil && !errors.Is(err, os.ErrNotExist) {
+		bedSet.Logger.Warn().Err(err).Msg("failed to clean staging directory")
+	}
 	if err := os.MkdirAll(staging, 02775); err != nil {
 		return err
 	}
-	defer os.RemoveAll(staging)
+	defer func() {
+		if err := os.RemoveAll(staging); err != nil && !errors.Is(err, os.ErrNotExist) {
+			bedSet.Logger.Warn().Err(err).Msg("failed to remove staging directory")
+		}
+	}()
 	for _, e := range entries {
 		if e.IsDir() || strings.HasPrefix(e.Name(), ".") {
 			continue
@@ -271,14 +291,18 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer in.Close()
+	defer func() {
+		if err := in.Close(); err != nil {
+			bedSet.Logger.Error().Err(err).Msg("failed to close source file")
+		}
+	}()
 	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0664)
 	if err != nil {
 		return err
 	}
 	_, err = io.Copy(out, in)
-	if e := out.Close(); err == nil {
-		err = e
+	if closeErr := out.Close(); err == nil {
+		err = closeErr
 	}
 	return err
 }

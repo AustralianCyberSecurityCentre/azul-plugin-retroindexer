@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	bedSet "github.com/AustralianCyberSecurityCentre/azul-bedrock/v13/gosrc/settings"
 	"github.com/AustralianCyberSecurityCentre/azul-bedrock/v13/gosrc/store"
 )
 
@@ -73,7 +74,7 @@ func FromEnv() (Settings, error) {
 		}
 		u, err := url.Parse(s.Endpoint)
 		if err != nil || u.Scheme != "https" || u.Host == "" {
-			return s, errors.New("Azure Blob endpoint must be an https URL")
+			return s, errors.New("azure blob endpoint must be an https URL")
 		}
 	}
 	if s.Backend == "s3" && (s.AccessKey == "") != (s.SecretKey == "") {
@@ -129,7 +130,13 @@ func (p *Publisher) UploadFile(path, processor string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			bedSet.Logger.Error().
+				Err(err).
+				Msg("failed to close index file")
+		}
+	}()
 	st, err := f.Stat()
 	if err != nil {
 		return "", err

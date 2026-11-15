@@ -48,7 +48,11 @@ func (p *IngestPlugin) Execute(ctx context.Context, job *plugin.Job, input *plug
 	if err != nil {
 		return plugin.NewPluginError(plugin.ErrorException, "Cannot open input", err.Error())
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			input.Logger.Error().Err(err).Msg("Failed to close file.")
+		}
+	}()
 	added, err := p.Pipeline.AddStream(f, indexing.Metadata{StreamLabel: "content", StreamSource: src.Source.Name})
 	if err != nil {
 		return plugin.NewPluginError(plugin.ErrorException, "Failed to stage index content", fmt.Sprintf("%v", err))

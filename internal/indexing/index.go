@@ -16,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	bedSet "github.com/AustralianCyberSecurityCentre/azul-bedrock/v13/gosrc/settings"
 )
 
 var shaName = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
@@ -178,32 +180,58 @@ func (p *Pipeline) Generate(ctx context.Context, dir string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer os.Remove(input.Name())
+	defer func() {
+		if err := os.Remove(input.Name()); err != nil {
+			bedSet.Logger.Error().Err(err).Msg("failed to remove temporary file")
+		}
+	}()
 	count, err := collectInput(dir, input)
 	if err != nil {
-		input.Close()
+		if closeErr := input.Close(); closeErr != nil {
+			bedSet.Logger.Error().Err(closeErr).Msg("failed to close temporary file")
+		}
 		return "", err
 	}
 	if count == 0 {
-		input.Close()
+		if closeErr := input.Close(); closeErr != nil {
+			bedSet.Logger.Error().Err(closeErr).Msg("failed to close temporary file")
+		}
 		return "", fmt.Errorf("no valid metadata+binary pairs in %s", dir)
 	}
+
 	if _, err := input.Seek(0, io.SeekStart); err != nil {
-		input.Close()
+		if closeErr := input.Close(); closeErr != nil {
+			bedSet.Logger.Error().Err(closeErr).Msg("failed to close temporary file")
+		}
 		return "", err
 	}
+
 	indexBase := p.nextIndexBase()
+
 	// All indexes (including periodic snapshots) must have unique names.
 	// Otherwise a newer periodic build can overwrite an older failed upload.
 	// Writing to .hidden.bgi ensures readers never observe a partially built index.
 	hidden := filepath.Join(p.bgiDir(), "."+filepath.Base(indexBase))
-	defer os.Remove(hidden + ".bgi")
+
+	defer func() {
+		err := os.Remove(hidden + ".bgi")
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			bedSet.Logger.Error().Err(err).Msg("failed to remove temporary index")
+		}
+	}()
+
 	cctx, cancel := context.WithTimeout(ctx, p.Config.Timeout)
 	defer cancel()
+
 	cmd := exec.CommandContext(cctx, p.Config.Bigindex, "-p", hidden, "-z", "-L")
 	cmd.Stdin = input
+
 	out, err := cmd.CombinedOutput()
-	input.Close()
+
+	if closeErr := input.Close(); closeErr != nil {
+		bedSet.Logger.Error().Err(closeErr).Msg("failed to close temporary file")
+	}
+
 	if err != nil {
 		return "", fmt.Errorf("bgindex failed (%v): %s", err, string(out))
 	}
@@ -234,7 +262,9 @@ func (p *Pipeline) IndexReady(ctx context.Context, uploaded func(string) error) 
 		if final == "" {
 			continue
 		}
-		log.Printf("generated index %s", final)
+		bedSet.Logger.Info().
+			Str("index", final).
+			Msg("generated index")
 		n++
 		if uploaded != nil {
 			if err := uploaded(final); err != nil {

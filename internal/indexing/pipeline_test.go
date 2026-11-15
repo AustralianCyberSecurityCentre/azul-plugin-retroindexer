@@ -188,7 +188,16 @@ func TestSyncUploadsKeepLocalForTesting(t *testing.T) {
 }
 func TestPeriodicSingleFileGetsDummy(t *testing.T) {
 	p := testPipeline(t, 1024)
-	p.AddStream(strings.NewReader("hello"), Metadata{StreamLabel: "content", StreamSource: "test"})
+	added, err := p.AddStream(strings.NewReader("hello"), Metadata{
+		StreamLabel:  "content",
+		StreamSource: "test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !added {
+		t.Fatal("expected stream to be added")
+	}
 	if err := p.PeriodicCopy(); err != nil {
 		t.Fatal(err)
 	}
