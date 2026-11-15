@@ -25,9 +25,8 @@ COPY . .
 
 RUN make biggrep
 
-RUN --mount=type=ssh \
-    go build -trimpath -tags netgo -ldflags='-s -w' \
-    -o /go/bin/azul-plugin-retroindexer .
+RUN go build -trimpath -tags netgo -ldflags='-s -w' \
+    -o /out/azul-plugin-retroindexer .
 
 RUN install -Dm755 .build/bin/bgindex /go/bin/bgindex
 
