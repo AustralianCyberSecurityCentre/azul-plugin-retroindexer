@@ -3,7 +3,7 @@
 
 ARG REGISTRY="docker.io/library"
 ARG BASE_IMAGE=golang
-ARG BASE_TAG=1.27-trixie
+ARG BASE_TAG=1.27-trixie@sha256:af1bfc2614ebb1dbd31af514b78740fd678850e76498762b425ecee4c5c6ea80
 
 FROM ${REGISTRY}/${BASE_IMAGE}:${BASE_TAG} AS builder
 
@@ -39,7 +39,9 @@ RUN go build -trimpath -tags netgo -ldflags='-s -w' \
 RUN install -Dm755 .build/bin/bgindex /go/bin/bgindex
 
 # BigGrep is dynamically linked so we need a Debian runtime image.
-FROM ${REGISTRY}/debian:trixie
+#FROM ${REGISTRY}/debian:trixie
+# Temporary test to use a known-good mirrored image.
+FROM ${REGISTRY}/${BASE_IMAGE}:${BASE_TAG}
 
 ENV DEBIAN_FRONTEND=noninteractive
 
