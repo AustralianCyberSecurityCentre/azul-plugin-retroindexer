@@ -20,6 +20,7 @@ import (
 const MinDataSize = 4
 const metaSuffix = "-meta"
 
+// Metadata accompanies each cached binary and becomes a BigGrep input label.
 type Metadata struct {
 	StreamLabel  string  `json:"stream_label"`
 	StreamSource string  `json:"stream_source"`
@@ -45,6 +46,8 @@ func validMetadata(m Metadata) error {
 	return nil
 }
 
+// Pipeline shares one staging area between Dispatcher ingestion and indexing.
+// Its mutex protects cache writes and periodic snapshots.
 type Pipeline struct {
 	Config       Config
 	lastPeriodic time.Time
@@ -133,6 +136,7 @@ func (p *Pipeline) AddStream(r io.Reader, m Metadata) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	// Rotate the existing batch before admitting a file that would exceed the limit.
 	if cached+size > p.Config.MaxBytes && cached > 0 {
 		if err := p.rotateCache(); err != nil {
 			return false, err
@@ -196,6 +200,8 @@ func (p *Pipeline) nextReadyDir() (string, error) {
 	}
 	return filepath.Join(parent, strconv.Itoa(n+1)), nil
 }
+
+// rotateCache atomically moves the active cache to a numbered ready directory.
 func (p *Pipeline) rotateCache() error {
 	bytes, err := p.CacheBytes()
 	if err != nil {
@@ -217,7 +223,7 @@ func (p *Pipeline) rotateCache() error {
 // Flush stages the current cache as an ordinary size-based index (useful for shutdown/manual tests).
 func (p *Pipeline) Flush() error { return p.rotateCache() }
 
-// PeriodicCopy snapshots the current cache without removing it (the Python behaviour).
+// PeriodicCopy snapshots the active cache without clearing it, matching Python behaviour.
 func (p *Pipeline) PeriodicCopy() error {
 	if p.Config.Periodic <= 0 {
 		return nil
@@ -306,6 +312,8 @@ func copyFile(src, dst string) error {
 	}
 	return err
 }
+
+// MaybePeriodic serialises snapshot creation with incoming content writes.
 func (p *Pipeline) MaybePeriodic() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()

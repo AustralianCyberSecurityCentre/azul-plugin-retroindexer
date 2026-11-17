@@ -22,6 +22,7 @@ import (
 
 var shaName = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
 
+// ReadyDirs finds rotated batches in date and sequence order.
 func (p *Pipeline) ReadyDirs() ([]string, error) {
 	root, err := os.ReadDir(p.base())
 	if err != nil {
@@ -126,6 +127,8 @@ func (p *Pipeline) failedLastTime(dir string) bool {
 	raw, err := os.ReadFile(p.lastAttempt())
 	return err == nil && string(raw) == dir
 }
+
+// splitOrQuarantine halves a failed batch once; repeated failures remain on disk.
 func splitOrQuarantine(dir string) error {
 	// Do not delete failed inputs: data loss is unacceptable. Quarantine persistent failures.
 	if strings.Contains(filepath.Base(dir), "-split") {
@@ -166,6 +169,9 @@ func splitOrQuarantine(dir string) error {
 	}
 	return os.Remove(dir)
 }
+
+// Generate runs bgindex against one ready batch and publishes its output
+// atomically on the local filesystem before removing the source batch.
 func (p *Pipeline) Generate(ctx context.Context, dir string) (string, error) {
 	if p.failedLastTime(dir) && p.Config.SplitOnFailure {
 		if err := splitOrQuarantine(dir); err != nil {
@@ -248,6 +254,9 @@ func (p *Pipeline) Generate(ctx context.Context, dir string) (string, error) {
 	}
 	return final, nil
 }
+
+// IndexReady processes staged batches; cloud publication is handled separately
+// in normal operation, allowing failed uploads to be retried.
 func (p *Pipeline) IndexReady(ctx context.Context, uploaded func(string) error) (int, error) {
 	dirs, err := p.ReadyDirs()
 	if err != nil {

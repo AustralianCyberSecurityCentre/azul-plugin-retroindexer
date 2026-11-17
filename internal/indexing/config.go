@@ -8,6 +8,7 @@ import (
 	"time"
 )
 
+// Config controls local staging, rotation, and BigGrep execution.
 type Config struct {
 	Root            string
 	Name            string
@@ -39,6 +40,8 @@ func parseInt(key string, defaultValue int64) (int64, error) {
 	}
 	return n, nil
 }
+
+// FromEnv reads deployment settings and validates limits before startup.
 func FromEnv() (Config, error) {
 	c := Config{Root: getenv("RETROINDEXER_ROOT_PATH", "/indices"), Name: getenv("RETROINDEXER_INDEXER_NAME", "content"), Bigindex: getenv("RETROINDEXER_BGINDEX", "bgindex"), StreamLabels: make(map[string]bool), SplitOnFailure: true}
 	for _, s := range strings.Split(getenv("RETROINDEXER_STREAM_LABELS", "content"), ",") {

@@ -29,6 +29,7 @@ func (p *Pipeline) SyncUploads(target string, upload func(string) error, keepLoc
 	if err != nil {
 		return 0, err
 	}
+	// Receipts are scoped to the destination, avoiding false positives after a backend change.
 	targetHash := sha256.Sum256([]byte(target))
 	suffix := hex.EncodeToString(targetHash[:8])
 	count := 0
@@ -63,6 +64,7 @@ func (p *Pipeline) SyncUploads(target string, upload func(string) error, keepLoc
 			return count, fmt.Errorf("index changed during cloud upload: %s (retained for retry)", path)
 		}
 		if keepLocal {
+			// Keep a durable receipt so test-mode indexes are not sent every poll.
 			data, err := json.Marshal(uploadReceipt{Target: target, Size: before.Size(), ModTime: before.ModTime().UnixNano()})
 			if err != nil {
 				return count, err

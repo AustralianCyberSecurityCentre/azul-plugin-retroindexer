@@ -22,12 +22,17 @@ func (p *IngestPlugin) GetDescription() string {
 func (p *IngestPlugin) GetFeatures() []events.PluginEntityFeature {
 	return []events.PluginEntityFeature{}
 }
+
+// Bedrock subscribes this plugin to sourced/extracted content events; historic
+// replay is opt-in through the pipeline configuration.
 func (p *IngestPlugin) GetDefaultSettings() *plugin.PluginSettings {
 	return plugin.NewDefaultPluginSettings().
 		WithFilterAllowEventTypes([]events.BinaryAction{events.ActionSourced, events.ActionExtracted}).
 		WithRequireHistoric(p.Pipeline.Config.RequireHistoric).
 		WithFilterDataTypes(map[string][]string{"content": {}})
 }
+
+// Execute receives a Dispatcher job and stages its content for later indexing.
 func (p *IngestPlugin) Execute(ctx context.Context, job *plugin.Job, input *plugin.PluginInputUtils) *plugin.PluginError {
 	if ctx.Err() != nil {
 		return plugin.NewPluginError(plugin.ErrorTimeout, "Cancelled", ctx.Err().Error())

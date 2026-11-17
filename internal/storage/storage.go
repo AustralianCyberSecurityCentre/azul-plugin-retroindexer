@@ -17,6 +17,7 @@ import (
 	"github.com/AustralianCyberSecurityCentre/azul-bedrock/v13/gosrc/store"
 )
 
+// Settings selects S3 or Azure Blob using the same logical bucket/prefix layout.
 type Settings struct {
 	Backend        string
 	Bucket         string // S3 bucket or Azure Blob container
@@ -38,6 +39,7 @@ func env(key, fallback string) string {
 	return fallback
 }
 
+// FromEnv validates cloud configuration without establishing a connection.
 func FromEnv() (Settings, error) {
 	s := Settings{
 		Backend:        strings.ToLower(env("RETROINDEXER_STORAGE_BACKEND", "none")),
@@ -91,6 +93,8 @@ type Publisher struct {
 	target  string
 }
 
+// New adapts the selected backend to Bedrock store.FileStorage. Both Azure
+// Blob containers and S3 buckets are written through the same Put method.
 func New(s Settings) (*Publisher, error) {
 	if s.Backend == "none" {
 		return nil, nil
@@ -99,11 +103,14 @@ func New(s Settings) (*Publisher, error) {
 	var err error
 	switch s.Backend {
 	case "azure":
+		// Bedrock handles Azure Blob authentication and the blob upload.
 		backend, err = store.NewAzureStore(s.Endpoint, s.Bucket, s.AzureAccount, s.AzureAccessKey, nil)
 	case "s3":
 		if s.AccessKey == "" {
+			// Use workload/instance IAM credentials when explicit keys are absent.
 			backend, err = store.NewS3StoreIAM(s.Endpoint, s.Secure, s.Bucket, s.Region, nil, store.AutomaticAgeOffSettings{})
 		} else {
+			// Explicit keys also support S3-compatible services.
 			backend, err = store.NewS3Store(s.Endpoint, s.AccessKey, s.SecretKey, s.Secure, s.Bucket, s.Region, nil, store.AutomaticAgeOffSettings{})
 		}
 	default:
@@ -154,6 +161,7 @@ func (p *Publisher) UploadFile(path, processor string) (string, error) {
 	if p.prefix != "" {
 		source = p.prefix
 	}
+	// FileStorage.Put maps source/label/name onto the backend object path.
 	label := processor + "/bgi"
 	if err = p.backend.Put(source, label, name, f, st.Size()); err != nil {
 		return "", err

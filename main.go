@@ -21,6 +21,8 @@ func main() {
 		log.Fatal(err)
 	}
 }
+
+// run wires the dispatcher ingestor, index builder, and optional cloud publisher.
 func run() error {
 	mode := flag.String("mode", "all", "all (Go plugin ingestor + indexer), or index (index existing staging batches)")
 	flush := flag.Bool("flush", false, "rotate current cache into ready batch and exit")
@@ -59,6 +61,7 @@ func run() error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
+	// Build rotated batches first, then publish any completed indexes awaiting upload.
 	indexTick := func() error {
 		_, indexErr := p.IndexReady(ctx, nil)
 		// Even after an indexing failure, retry publishing indexes from prior passes.
@@ -78,6 +81,7 @@ func run() error {
 		return indexErr
 	}
 
+	// Poll independently of incoming jobs so idle periods can still produce indexes.
 	background := func() {
 		for ctx.Err() == nil {
 			if err := p.MaybePeriodic(); err != nil {
