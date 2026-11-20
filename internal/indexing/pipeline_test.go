@@ -251,3 +251,44 @@ func TestPeriodicIndexesUseDistinctNames(t *testing.T) {
 		t.Fatalf("periodic indexes overwritten: entries=%v err=%v", entries, err)
 	}
 }
+
+// A permanently failing single-binary batch must be preserved but must not
+// prevent the indexer from processing the remaining ready directories.
+func TestSingleBinaryFailureQuarantinedAfterRetry(t *testing.T) {
+	p := testPipeline(t, 1024)
+	m := Metadata{StreamLabel: "content", StreamSource: "testing"}
+	if _, err := p.AddStream(strings.NewReader("failing binary"), m); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	p.Config.Bigindex = filepath.Join(t.TempDir(), "missing-bgindex")
+	if _, err := p.IndexReady(context.Background(), nil); err == nil {
+		t.Fatal("first build should fail")
+	}
+	// Simulates a restart, with the persistent last-attempt marker intact.
+	restarted, err := New(p.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := restarted.IndexReady(context.Background(), nil)
+	if err != nil || n != 0 {
+		t.Fatalf("quarantine: count %d error %v", n, err)
+	}
+	ready, err := restarted.ReadyDirs()
+	if err != nil || len(ready) != 0 {
+		t.Fatalf("quarantined batch still blocks indexing: %v %v", ready, err)
+	}
+	quarantined, err := os.ReadDir(filepath.Join(restarted.stateDir(), "quarantine"))
+	if err != nil || len(quarantined) != 1 {
+		t.Fatalf("missing quarantined batch: %v %v", quarantined, err)
+	}
+	files, err := os.ReadDir(filepath.Join(restarted.stateDir(), "quarantine", quarantined[0].Name()))
+	if err != nil || len(files) != 2 {
+		t.Fatalf("binary or metadata lost: %v %v", files, err)
+	}
+	if _, err := os.Stat(restarted.lastAttempt()); !os.IsNotExist(err) {
+		t.Fatalf("stale last attempt marker: %v", err)
+	}
+}

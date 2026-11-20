@@ -22,6 +22,8 @@ import (
 
 var shaName = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
 
+var errCannotSplit = errors.New("failed batch cannot be split")
+
 // ReadyDirs finds rotated batches in date and sequence order.
 func (p *Pipeline) ReadyDirs() ([]string, error) {
 	root, err := os.ReadDir(p.base())
@@ -132,7 +134,7 @@ func (p *Pipeline) failedLastTime(dir string) bool {
 func splitOrQuarantine(dir string) error {
 	// Do not delete failed inputs: data loss is unacceptable. Quarantine persistent failures.
 	if strings.Contains(filepath.Base(dir), "-split") {
-		return fmt.Errorf("split directory %q failed again; retained for manual recovery", dir)
+		return fmt.Errorf("%w: split directory %q failed again", errCannotSplit, dir)
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -146,7 +148,7 @@ func splitOrQuarantine(dir string) error {
 	}
 	sort.Strings(stems)
 	if len(stems) < 2 {
-		return fmt.Errorf("cannot split %s: fewer than two binaries", dir)
+		return fmt.Errorf("%w: cannot split %s: fewer than two binaries", errCannotSplit, dir)
 	}
 	for i := 1; i <= 2; i++ {
 		if err := os.Mkdir(dir+fmt.Sprintf("-split-part%d", i), 02775); err != nil {
@@ -170,11 +172,56 @@ func splitOrQuarantine(dir string) error {
 	return os.Remove(dir)
 }
 
+// quarantineBatch moves a permanently failing batch outside ReadyDirs' date trees.
+// The binary and metadata files remain on the PVC for manual inspection/recovery.
+func (p *Pipeline) quarantineBatch(dir string, reason error) error {
+	quarantineRoot := filepath.Join(p.stateDir(), "quarantine")
+	if err := os.MkdirAll(quarantineRoot, 02775); err != nil {
+		return err
+	}
+	// Include the original date and batch name to avoid collisions across days.
+	basename := filepath.Base(filepath.Dir(dir)) + "-" + filepath.Base(dir)
+	var dest string
+	for i := 0; ; i++ {
+		dest = filepath.Join(quarantineRoot, basename)
+		if i > 0 {
+			dest += fmt.Sprintf("-%d", i)
+		}
+		_, err := os.Lstat(dest)
+		if errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		if err != nil {
+			return err
+		}
+	}
+	if err := os.Rename(dir, dest); err != nil {
+		return err
+	}
+	// A stale attempt marker must not affect the next ready batch.
+	if err := os.Remove(p.lastAttempt()); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("quarantined %s at %s but failed to clear attempt marker: %w", dir, dest, err)
+	}
+	bedSet.Logger.Error().Err(reason).Str("original", dir).Str("quarantine", dest).
+		Msg("index batch quarantined after persistent indexing failure; files retained for manual recovery")
+	return nil
+}
+
 // Generate runs bgindex against one ready batch and publishes its output
 // atomically on the local filesystem before removing the source batch.
 func (p *Pipeline) Generate(ctx context.Context, dir string) (string, error) {
 	if p.failedLastTime(dir) && p.Config.SplitOnFailure {
 		if err := splitOrQuarantine(dir); err != nil {
+			if errors.Is(err, errCannotSplit) {
+				if quarantineErr := p.quarantineBatch(dir, err); quarantineErr != nil {
+					return "", quarantineErr
+				}
+				return "", nil // irreducible failures must not block all later batches
+			}
+			return "", err
+		}
+		// Clear the marker when split succeeds: the next directory has not failed.
+		if err := os.Remove(p.lastAttempt()); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return "", err
 		}
 		return "", nil // another pass will pick up split directories
