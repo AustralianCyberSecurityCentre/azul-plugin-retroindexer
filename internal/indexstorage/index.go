@@ -18,6 +18,7 @@ import (
 	"strings"
 	"syscall"
 
+	bedSet "github.com/AustralianCyberSecurityCentre/azul-bedrock/v13/gosrc/settings"
 	"github.com/AustralianCyberSecurityCentre/azul-bedrock/v13/gosrc/store"
 )
 
@@ -64,7 +65,11 @@ func HashFile(path string) (string, int64, error) {
 	if err != nil {
 		return "", 0, err
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			bedSet.Logger.Error().Err(err).Str("path", path).Msg("failed to close index file after hashing")
+		}
+	}()
 	h := sha256.New()
 	n, err := io.Copy(h, file)
 	if err != nil {
@@ -162,11 +167,19 @@ func (m Manager) Fetch(id, output string) error {
 	if err != nil {
 		return err
 	}
-	defer lock.Close()
+	defer func() {
+		if err := lock.Close(); err != nil {
+			bedSet.Logger.Error().Err(err).Str("path", output+".lock").Msg("failed to close index cache lock file")
+		}
+	}()
 	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
 		return err
 	}
-	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	defer func() {
+		if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_UN); err != nil {
+			bedSet.Logger.Error().Err(err).Str("path", output+".lock").Msg("failed to release index cache lock")
+		}
+	}()
 
 	// Validate the cached copy before making network requests. This costs one
 	// sequential disk scan, but avoids trusting a corrupt or truncated cache.
@@ -195,7 +208,11 @@ func (m Manager) Fetch(id, output string) error {
 	if err != nil {
 		return fmt.Errorf("fetch index: %w", err)
 	}
-	defer data.DataReader.Close()
+	defer func() {
+		if err := data.DataReader.Close(); err != nil {
+			bedSet.Logger.Error().Err(err).Str("index_id", id).Msg("failed to close downloaded index stream")
+		}
+	}()
 	if data.Avail <= 0 {
 		return errors.New("empty index object")
 	}
@@ -204,8 +221,20 @@ func (m Manager) Fetch(id, output string) error {
 	if err != nil {
 		return err
 	}
-	defer os.Remove(tmp.Name())
-	defer tmp.Close()
+	// Keep cleanup safe on both the error path and the successful rename path.
+	// Closing explicitly before rename helps detect buffered filesystem errors.
+	tmpPath := tmp.Name()
+	tmpClosed := false
+	defer func() {
+		if !tmpClosed {
+			if err := tmp.Close(); err != nil {
+				bedSet.Logger.Error().Err(err).Str("path", tmpPath).Msg("failed to close temporary index download")
+			}
+		}
+		if err := os.Remove(tmpPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			bedSet.Logger.Error().Err(err).Str("path", tmpPath).Msg("failed to remove temporary index download")
+		}
+	}()
 	if err := tmp.Chmod(0640); err != nil {
 		return err
 	}
@@ -223,8 +252,10 @@ func (m Manager) Fetch(id, output string) error {
 	if err := tmp.Sync(); err != nil {
 		return err
 	}
-	if err := tmp.Close(); err != nil {
-		return err
+	closeErr := tmp.Close()
+	tmpClosed = true
+	if closeErr != nil {
+		return closeErr
 	}
 	if err := os.Rename(tmp.Name(), output); err != nil {
 		return err
