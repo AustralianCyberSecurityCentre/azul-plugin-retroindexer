@@ -252,7 +252,7 @@ func (m Manager) Fetch(id, output string) error {
 	if err := tmp.Sync(); err != nil {
 		return err
 	}
-	closeErr := tmp.Close()
+	closeErr = tmp.Close()
 	tmpClosed = true
 	if closeErr != nil {
 		return closeErr
