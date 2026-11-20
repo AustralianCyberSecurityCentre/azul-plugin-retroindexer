@@ -1,3 +1,4 @@
+
 # Build BigGrep exactly as in Retrohunt (autogen/configure/make),
 # using the source archive committed under third_party/.
 
@@ -9,43 +10,34 @@ FROM ${REGISTRY}/${BASE_IMAGE}:${BASE_TAG} AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV GOOS=linux GOARCH=amd64 CGO_ENABLED=0 GO111MODULE=on
-#ENV GOPRIVATE=github.com/AustralianCyberSecurityCentre/*
 
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive \
     apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
         autoconf automake libtool make g++ pkg-config unzip \
-        libboost-all-dev zlib1g-dev python3
-
-#RUN git config --global url."git@github.com:AustralianCyberSecurityCentre/".insteadOf "https://github.com/AustralianCyberSecurityCentre/"
-
-RUN git config --list
-
-RUN go env GOPRIVATE
-RUN go env GOPROXY
-RUN go env GONOSUMDB
-
-RUN git ls-remote https://github.com/AustralianCyberSecurityCentre/azul-bedrock
+        libboost-all-dev zlib1g-dev python3 && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
 COPY . .
 
+# Compile BigGrep's indexing tools from the vendored source.
 RUN make biggrep
 
-RUN go build -trimpath -tags netgo -ldflags='-s -w' \
-    -o /out/azul-plugin-retroindexer .
-
-# Package the standalone index management CLI in this repository's image.
-# The Retrohunt Docker build can copy this executable from the same image.
-RUN go build -trimpath -tags netgo -ldflags='-s -w' \
-    -o /out/azul-index ./cmd/azul-index
+# Build the Retroindexer service and its standalone index-management CLI.
+# Retrohunt copies /usr/local/bin/azul-index from this published image.
+RUN mkdir -p /out && \
+    go build -trimpath -tags netgo -ldflags='-s -w' \
+        -o /out/azul-plugin-retroindexer . && \
+    go build -trimpath -tags netgo -ldflags='-s -w' \
+        -o /out/azul-index ./cmd
 
 RUN install -Dm755 .build/bin/bgindex /go/bin/bgindex
 
-# BigGrep is dynamically linked so we need a Debian runtime image.
-#FROM ${REGISTRY}/debian:trixie
-# Temporary test to use a known-good mirrored image.
+# BigGrep is dynamically linked, so the runtime needs its shared libraries.
+# Keep the existing mirrored Go image until a smaller Debian runtime
+# image is approved.
 FROM ${REGISTRY}/${BASE_IMAGE}:${BASE_TAG}
 
 ENV DEBIAN_FRONTEND=noninteractive
