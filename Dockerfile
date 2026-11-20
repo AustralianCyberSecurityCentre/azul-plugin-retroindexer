@@ -36,6 +36,11 @@ RUN make biggrep
 RUN go build -trimpath -tags netgo -ldflags='-s -w' \
     -o /out/azul-plugin-retroindexer .
 
+# Package the standalone index management CLI in this repository's image.
+# The Retrohunt Docker build can copy this executable from the same image.
+RUN go build -trimpath -tags netgo -ldflags='-s -w' \
+    -o /out/azul-index ./cmd/azul-index
+
 RUN install -Dm755 .build/bin/bgindex /go/bin/bgindex
 
 # BigGrep is dynamically linked so we need a Debian runtime image.
@@ -59,6 +64,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /out/azul-plugin-retroindexer /usr/local/bin/azul-plugin-retroindexer
+COPY --from=builder /out/azul-index /usr/local/bin/azul-index
 COPY --from=builder /go/bin/bgindex /usr/local/bin/bgindex
 
 ARG UID=21000

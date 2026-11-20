@@ -3,18 +3,14 @@
 package storage
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 
-	bedSet "github.com/AustralianCyberSecurityCentre/azul-bedrock/v13/gosrc/settings"
 	"github.com/AustralianCyberSecurityCentre/azul-bedrock/v13/gosrc/store"
+	"github.com/AustralianCyberSecurityCentre/azul-plugin-retroindexer/internal/indexstorage"
 )
 
 // Settings selects S3 or Azure Blob using the same logical bucket/prefix layout.
@@ -126,47 +122,42 @@ func New(s Settings) (*Publisher, error) {
 	}, nil
 }
 
-// UploadFile streams a completed .bgi into Bedrock. Its SHA256 forms an immutable
-// object name, so periodic indexes can be replaced locally without overwriting
-// the last cloud version. The caller removes the temporary .bgi only after Put succeeds.
+// ParseLocation converts a logical prefix to the two components expected by
+// Bedrock's FileStorage interface. The writer and CLI MUST use the same value.
+// The default is retrohunt/indices for compatibility with Retrohunt's reader.
+func ParseLocation(prefix string) (string, string, error) {
+	if prefix == "" {
+		prefix = "retrohunt/indices"
+	}
+	parts := strings.SplitN(prefix, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", fmt.Errorf("index prefix %q must contain source/label", prefix)
+	}
+	for _, component := range strings.Split(prefix, "/") {
+		if component == "" || component == "." || component == ".." || strings.ContainsAny(component, "\\\r\n") {
+			return "", "", fmt.Errorf("unsafe index prefix %q", prefix)
+		}
+	}
+	return parts[0], parts[1], nil
+}
+
+// UploadFile publishes an immutable, content-addressed index followed by a
+// ready marker. Retrohunt lists only ready markers and verifies SHA-256 on fetch.
+// Both the automatic publisher and azul-index CLI use the same protocol.
 func (p *Publisher) UploadFile(path, processor string) (string, error) {
-	if !strings.HasSuffix(path, ".bgi") {
+	if !strings.HasSuffix(strings.ToLower(path), ".bgi") {
 		return "", fmt.Errorf("not a .bgi index: %s", path)
 	}
-	f, err := os.Open(path)
+	source, label, err := ParseLocation(p.prefix)
 	if err != nil {
 		return "", err
 	}
-	defer func() {
-		if err := f.Close(); err != nil {
-			bedSet.Logger.Error().
-				Err(err).
-				Msg("failed to close index file")
-		}
-	}()
-	st, err := f.Stat()
+	manager := indexstorage.Manager{Storage: p.backend, Source: source, Label: label}
+	id, err := manager.Put(path)
 	if err != nil {
 		return "", err
 	}
-	h := sha256.New()
-	if _, err = io.Copy(h, f); err != nil {
-		return "", err
-	}
-	if _, err = f.Seek(0, io.SeekStart); err != nil {
-		return "", err
-	}
-	checksum := hex.EncodeToString(h.Sum(nil))
-	name := strings.TrimSuffix(filepath.Base(path), ".bgi") + "-" + checksum + ".bgi"
-	source := "retrohunt"
-	if p.prefix != "" {
-		source = p.prefix
-	}
-	// FileStorage.Put maps source/label/name onto the backend object path.
-	label := processor + "/bgi"
-	if err = p.backend.Put(source, label, name, f, st.Size()); err != nil {
-		return "", err
-	}
-	return source + "/" + label + "/" + name, nil
+	return source + "/" + label + "/" + id + ".bgi", nil
 }
 
 func (p *Publisher) Target() string { return p.target }

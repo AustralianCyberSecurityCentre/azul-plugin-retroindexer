@@ -1,8 +1,15 @@
 package storage
 
 import (
+	"bytes"
+	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/AustralianCyberSecurityCentre/azul-bedrock/v13/gosrc/store"
+	"github.com/AustralianCyberSecurityCentre/azul-plugin-retroindexer/internal/indexstorage"
 )
 
 func TestStorageDisabledByDefault(t *testing.T) {
@@ -51,5 +58,53 @@ func TestS3Validation(t *testing.T) {
 	got, err := FromEnv()
 	if err != nil || got.Prefix != "retrohunt/indices" {
 		t.Fatalf("unexpected %v %+v", err, got)
+	}
+}
+
+// TestPublisherUsesRetrohuntProtocol guards against accidentally reverting to
+// the old timestamp-and-processor naming scheme. Retrohunt must be able to
+// discover and fetch every index published by Retroindexer.
+func TestPublisherUsesRetrohuntProtocol(t *testing.T) {
+	backend, err := store.NewLocalStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	publisher := &Publisher{backend: backend, prefix: "retrohunt/indices"}
+	index := filepath.Join(t.TempDir(), "batch.bgi")
+	if err := os.WriteFile(index, []byte("example index bytes"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	object, err := publisher.UploadFile(index, "content")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := indexstorage.Manager{Storage: backend, Source: "retrohunt", Label: "indices"}
+	ids, err := manager.List(context.Background())
+	if err != nil || len(ids) != 1 {
+		t.Fatalf("published indexes: %v (%v)", ids, err)
+	}
+	if object != "retrohunt/indices/"+ids[0]+".bgi" {
+		t.Fatalf("wrong object key %q", object)
+	}
+	fetched := filepath.Join(t.TempDir(), "fetched.bgi")
+	if err := manager.Fetch(ids[0], fetched); err != nil {
+		t.Fatal(err)
+	}
+	original, _ := os.ReadFile(index)
+	downloaded, _ := os.ReadFile(fetched)
+	if !bytes.Equal(original, downloaded) {
+		t.Fatal("retrieved bytes differ")
+	}
+}
+
+func TestParseLocation(t *testing.T) {
+	for _, raw := range []string{"../bad/path", "onlyone", "retrohunt//indices", "retrohunt/../indices"} {
+		if _, _, err := ParseLocation(raw); err == nil {
+			t.Fatalf("expected invalid prefix: %s", raw)
+		}
+	}
+	source, label, err := ParseLocation("retrohunt/indices")
+	if err != nil || source != "retrohunt" || label != "indices" {
+		t.Fatalf("location: %s/%s %v", source, label, err)
 	}
 }
