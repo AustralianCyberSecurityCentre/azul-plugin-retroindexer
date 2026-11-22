@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	bedSet "github.com/AustralianCyberSecurityCentre/azul-bedrock/v13/gosrc/settings"
@@ -47,7 +48,7 @@ func validMetadata(m Metadata) error {
 }
 
 // Pipeline shares one staging area between Dispatcher ingestion and indexing.
-// Its mutex protects cache writes and periodic snapshots.
+// Its mutex protects cache writes and periodic flushes.
 type Pipeline struct {
 	Config       Config
 	lastPeriodic time.Time
@@ -89,6 +90,40 @@ func (p *Pipeline) CacheBytes() (int64, error) {
 	return sum, nil
 }
 
+// freeSpaceGuard refuses writes when the PVC would dip below the configured
+// reserve. The check is repeated during streaming so a large input cannot
+// exhaust the volume between the first and last write.
+type freeSpaceGuard struct {
+	destination io.Writer
+	directory   string
+	reserve     int64
+	sinceCheck  int64
+}
+
+func availableBytes(directory string) (int64, error) {
+	var stats syscall.Statfs_t
+	if err := syscall.Statfs(directory, &stats); err != nil {
+		return 0, err
+	}
+	return int64(stats.Bavail) * int64(stats.Bsize), nil
+}
+
+func (w *freeSpaceGuard) Write(data []byte) (int, error) {
+	if w.reserve > 0 && (w.sinceCheck == 0 || w.sinceCheck >= 16*1024*1024) {
+		available, err := availableBytes(w.directory)
+		if err != nil {
+			return 0, fmt.Errorf("check staging PVC free space: %w", err)
+		}
+		if available-int64(len(data)) < w.reserve {
+			return 0, fmt.Errorf("insufficient free PVC space for staging: available %d bytes, reserve %d bytes", available, w.reserve)
+		}
+		w.sinceCheck = 0
+	}
+	n, err := w.destination.Write(data)
+	w.sinceCheck += int64(n)
+	return n, err
+}
+
 // AddStream streams directly to a temporary cache file; multi-GiB content is never held in memory.
 // A completed stream is atomically named by its CONTENT hash, matching the original Python ingestor.
 func (p *Pipeline) AddStream(r io.Reader, m Metadata) (bool, error) {
@@ -114,7 +149,8 @@ func (p *Pipeline) AddStream(r io.Reader, m Metadata) (bool, error) {
 		}
 	}()
 	h := sha256.New()
-	size, copyErr := io.Copy(io.MultiWriter(tmp, h), io.LimitReader(r, p.Config.MaxBytes+1))
+	guarded := &freeSpaceGuard{destination: io.MultiWriter(tmp, h), directory: p.stateDir(), reserve: p.Config.MinFreeBytes}
+	size, copyErr := io.Copy(guarded, io.LimitReader(r, p.Config.MaxBytes+1))
 	closeErr := tmp.Close()
 	if copyErr != nil {
 		return false, copyErr
@@ -177,6 +213,15 @@ func (p *Pipeline) AddStream(r io.Reader, m Metadata) (bool, error) {
 		}
 		return false, err
 	}
+	// Rotate immediately at the threshold; a subsequent stream is not required.
+	// Metadata has already been atomically written, so the ready batch is complete.
+	if cachedNow, err := p.CacheBytes(); err != nil {
+		return true, err
+	} else if cachedNow >= p.Config.MaxBytes {
+		if err := p.rotateCache(); err != nil {
+			return true, err
+		}
+	}
 	return true, nil
 }
 func (p *Pipeline) nextReadyDir() (string, error) {
@@ -210,6 +255,12 @@ func (p *Pipeline) rotateCache() error {
 	if bytes == 0 {
 		return nil
 	}
+	// BigGrep needs at least two input entries. Preserve the original
+	// periodic behaviour for all single-binary batches (including size-triggered
+	// rotations) by adding a synthetic second entry to the batch.
+	if err := p.addSingleBatchDummy(); err != nil {
+		return err
+	}
 	ready, err := p.nextReadyDir()
 	if err != nil {
 		return err
@@ -220,97 +271,57 @@ func (p *Pipeline) rotateCache() error {
 	return os.MkdirAll(p.cacheDir(), 02775)
 }
 
-// Flush stages the current cache as an ordinary size-based index (useful for shutdown/manual tests).
-func (p *Pipeline) Flush() error { return p.rotateCache() }
-
-// PeriodicCopy snapshots the active cache without clearing it, matching Python behaviour.
-func (p *Pipeline) PeriodicCopy() error {
-	if p.Config.Periodic <= 0 {
-		return nil
-	}
+// addSingleBatchDummy ensures the BigGrep builder gets two input entries.
+// The dummy is deterministic and is never added when two real files are present.
+func (p *Pipeline) addSingleBatchDummy() error {
 	entries, err := os.ReadDir(p.cacheDir())
 	if err != nil {
 		return err
 	}
-	n := 0
-	for _, e := range entries {
-		if !e.IsDir() && !strings.HasPrefix(e.Name(), ".") && !strings.HasSuffix(e.Name(), metaSuffix) {
-			n++
+	count := 0
+	for _, entry := range entries {
+		if !entry.IsDir() && shaName.MatchString(entry.Name()) {
+			count++
 		}
 	}
-	if n == 0 {
+	if count != 1 {
 		return nil
 	}
-	parent, err := p.nextReadyDir()
+	dummy := []byte("dummy-file")
+	digest := sha256.Sum256(dummy)
+	name := hex.EncodeToString(digest[:])
+	dataPath := filepath.Join(p.cacheDir(), name)
+	if _, err := os.Stat(dataPath); err == nil {
+		// The real content happens to equal the synthetic marker.
+		dummy = []byte("dummy-file-2")
+		digest = sha256.Sum256(dummy)
+		name = hex.EncodeToString(digest[:])
+		dataPath = filepath.Join(p.cacheDir(), name)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.WriteFile(dataPath, dummy, 0664); err != nil {
+		return err
+	}
+	meta, err := json.Marshal(Metadata{StreamLabel: "content", StreamSource: "testing"})
 	if err != nil {
 		return err
 	}
-	dest := filepath.Join(filepath.Dir(parent), "periodic")
-	if _, err := os.Stat(dest); err == nil {
-		return nil
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-	staging := filepath.Join(p.stateDir(), "periodic-stash")
-	if err := os.RemoveAll(staging); err != nil && !errors.Is(err, os.ErrNotExist) {
-		bedSet.Logger.Warn().Err(err).Msg("failed to clean staging directory")
-	}
-	if err := os.MkdirAll(staging, 02775); err != nil {
-		return err
-	}
-	defer func() {
-		if err := os.RemoveAll(staging); err != nil && !errors.Is(err, os.ErrNotExist) {
-			bedSet.Logger.Warn().Err(err).Msg("failed to remove staging directory")
-		}
-	}()
-	for _, e := range entries {
-		if e.IsDir() || strings.HasPrefix(e.Name(), ".") {
-			continue
-		}
-		from := filepath.Join(p.cacheDir(), e.Name())
-		to := filepath.Join(staging, e.Name())
-		if err := copyFile(from, to); err != nil {
-			return err
-		}
-	}
-	// Like the Python implementation, add a dummy entry when the periodic
-	// snapshot contains exactly one real binary. Keep the active cache intact.
-	if n == 1 {
-		dummy := []byte("dummy-file")
-		hash := sha256.Sum256(dummy)
-		stem := hex.EncodeToString(hash[:])
-		if err := os.WriteFile(filepath.Join(staging, stem), dummy, 0664); err != nil {
-			return err
-		}
-		meta, err := json.Marshal(Metadata{StreamLabel: "content", StreamSource: "testing"})
-		if err != nil {
-			return err
-		}
-		if err := os.WriteFile(filepath.Join(staging, stem+metaSuffix), meta, 0664); err != nil {
-			return err
-		}
-	}
-	return os.Rename(staging, dest)
+	return os.WriteFile(dataPath+metaSuffix, meta, 0664)
 }
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
+
+// Flush stages the current cache as an ordinary size-based index (useful for shutdown/manual tests).
+func (p *Pipeline) Flush() error { return p.rotateCache() }
+
+// PeriodicCopy flushes the active cache as an ordinary ready batch.
+// The name is retained for compatibility with existing callers. Unlike the
+// previous snapshot implementation, this does not duplicate binaries on the PVC
+// or leave the same data in the active cache for re-indexing.
+func (p *Pipeline) PeriodicCopy() error {
+	if p.Config.Periodic <= 0 {
+		return nil
 	}
-	defer func() {
-		if err := in.Close(); err != nil {
-			bedSet.Logger.Error().Err(err).Msg("failed to close source file")
-		}
-	}()
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0664)
-	if err != nil {
-		return err
-	}
-	_, err = io.Copy(out, in)
-	if closeErr := out.Close(); err == nil {
-		err = closeErr
-	}
-	return err
+	return p.rotateCache()
 }
 
 // MaybePeriodic serialises snapshot creation with incoming content writes.

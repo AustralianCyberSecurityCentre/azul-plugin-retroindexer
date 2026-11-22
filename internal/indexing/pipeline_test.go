@@ -108,25 +108,75 @@ func TestFailedBuildRetainsInputs(t *testing.T) {
 		t.Fatalf("indexing failure lost files %v", dirs)
 	}
 }
-func TestPeriodicCopy(t *testing.T) {
+func TestPeriodicFlushMovesCacheIntoSearchableBatch(t *testing.T) {
 	p := testPipeline(t, 1024)
 	m := Metadata{StreamLabel: "content", StreamSource: "testing"}
-	for _, s := range []string{"abcde", "xyz123"} {
-		if _, err := p.AddStream(strings.NewReader(s), m); err != nil {
+	for _, value := range []string{"abcde", "xyz123"} {
+		if _, err := p.AddStream(strings.NewReader(value), m); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if err := p.PeriodicCopy(); err != nil {
 		t.Fatal(err)
 	}
-	ready, _ := p.ReadyDirs()
-	if len(ready) != 1 || filepath.Base(ready[0]) != "periodic" {
-		t.Fatalf("ready: %v", ready)
+	ready, err := p.ReadyDirs()
+	if err != nil || len(ready) != 1 {
+		t.Fatalf("ready: %v, %v", ready, err)
 	}
-	if size, _ := p.CacheBytes(); size != 11 {
-		t.Fatalf("periodic copy modified live cache: %d", size)
+	if filepath.Base(ready[0]) != "1" {
+		t.Fatalf("periodic batch should be numbered, got %s", ready[0])
+	}
+	if size, err := p.CacheBytes(); err != nil || size != 0 {
+		t.Fatalf("periodic flush left binary duplicates in cache: bytes=%d err=%v", size, err)
+	}
+	entries, err := os.ReadDir(ready[0])
+	if err != nil || len(entries) != 4 {
+		t.Fatalf("periodic batch should preserve binaries and metadata: %v %v", entries, err)
+	}
+	// An idle subsequent periodic trigger must not create duplicate batches.
+	if err := p.PeriodicCopy(); err != nil {
+		t.Fatal(err)
+	}
+	if ready, err := p.ReadyDirs(); err != nil || len(ready) != 1 {
+		t.Fatalf("idle periodic flush made a duplicate batch: %v %v", ready, err)
 	}
 }
+
+func TestExactlyAtThresholdRotatesImmediately(t *testing.T) {
+	p := testPipeline(t, 10)
+	added, err := p.AddStream(strings.NewReader("1234567890"), Metadata{StreamLabel: "content", StreamSource: "testing"})
+	if err != nil || !added {
+		t.Fatalf("add stream: %t %v", added, err)
+	}
+	if bytes, err := p.CacheBytes(); err != nil || bytes != 0 {
+		t.Fatalf("cache not rotated at threshold: %d %v", bytes, err)
+	}
+	ready, err := p.ReadyDirs()
+	if err != nil || len(ready) != 1 {
+		t.Fatalf("expected threshold-triggered ready batch: %v %v", ready, err)
+	}
+	files, err := os.ReadDir(ready[0])
+	if err != nil || len(files) != 4 {
+		t.Fatalf("expected real and dummy binary+metadata: %v %v", files, err)
+	}
+}
+
+func TestMinimumPVCReserveRejectsIngestion(t *testing.T) {
+	p := testPipeline(t, 1024)
+	free, err := availableBytes(p.stateDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Config.MinFreeBytes = free + 1
+	_, err = p.AddStream(strings.NewReader("12345"), Metadata{StreamLabel: "content", StreamSource: "testing"})
+	if err == nil || !strings.Contains(err.Error(), "insufficient free PVC space") {
+		t.Fatalf("expected free-space safeguard, got %v", err)
+	}
+	if bytes, err := p.CacheBytes(); err != nil || bytes != 0 {
+		t.Fatalf("rejected stream reached cache: %d %v", bytes, err)
+	}
+}
+
 func TestSyncUploadsDeletesOnlyAfterSuccess(t *testing.T) {
 	p := testPipeline(t, 1024)
 	path := filepath.Join(p.bgiDir(), "completed.bgi")
@@ -224,21 +274,19 @@ func TestHistoricRequirementIsConfigurable(t *testing.T) {
 	}
 }
 
-// Periodic snapshots must not overwrite an index still awaiting cloud upload.
+// Independently flushed batches must not overwrite an earlier index awaiting upload.
 func TestPeriodicIndexesUseDistinctNames(t *testing.T) {
 	p := testPipeline(t, 1024)
-	for _, data := range []string{"alpha", "bravo"} {
-		if _, err := p.AddStream(strings.NewReader(data), Metadata{StreamLabel: "content", StreamSource: "testing"}); err != nil {
-			t.Fatal(err)
-		}
-	}
 	tool := filepath.Join(t.TempDir(), "bgindex")
 	script := "#!/bin/sh\nset -eu\n[ \"$1\" = \"-p\" ] || exit 1\ncat > \"$2.bgi\"\n"
 	if err := os.WriteFile(tool, []byte(script), 0755); err != nil {
 		t.Fatal(err)
 	}
 	p.Config.Bigindex = tool
-	for i := 0; i < 2; i++ {
+	for i, data := range []string{"alpha", "bravo"} {
+		if _, err := p.AddStream(strings.NewReader(data), Metadata{StreamLabel: "content", StreamSource: "testing"}); err != nil {
+			t.Fatal(err)
+		}
 		if err := p.PeriodicCopy(); err != nil {
 			t.Fatal(err)
 		}
@@ -290,5 +338,35 @@ func TestSingleBinaryFailureQuarantinedAfterRetry(t *testing.T) {
 	}
 	if _, err := os.Stat(restarted.lastAttempt()); !os.IsNotExist(err) {
 		t.Fatalf("stale last attempt marker: %v", err)
+	}
+}
+
+// Low disk space must not be treated as a permanently failing batch; once
+// capacity becomes available the same batch can be retried safely.
+func TestInsufficientIndexWorkspacePreservesBatch(t *testing.T) {
+	p := testPipeline(t, 1024)
+	m := Metadata{StreamLabel: "content", StreamSource: "testing"}
+	for _, value := range []string{"alpha", "bravo"} {
+		if _, err := p.AddStream(strings.NewReader(value), m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := p.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	free, err := availableBytes(p.stateDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Config.MinFreeBytes = free
+	if _, err := p.IndexReady(context.Background(), nil); err == nil || !strings.Contains(err.Error(), "insufficient free PVC space to build index") {
+		t.Fatalf("expected low disk space error, got %v", err)
+	}
+	if _, err := os.Stat(p.lastAttempt()); !os.IsNotExist(err) {
+		t.Fatalf("disk pressure must not mark a batch as broken: %v", err)
+	}
+	ready, err := p.ReadyDirs()
+	if err != nil || len(ready) != 1 {
+		t.Fatalf("batch should remain ready: %v %v", ready, err)
 	}
 }

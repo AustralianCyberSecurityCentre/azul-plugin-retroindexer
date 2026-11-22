@@ -25,13 +25,10 @@ COPY . .
 # Compile BigGrep's indexing tools from the vendored source.
 RUN make biggrep
 
-# Build the Retroindexer service and its standalone index-management CLI.
-# Retrohunt copies /usr/local/bin/azul-index from this published image.
+# Build only the Retroindexer service. Retrohunt reads cloud indexes via Python.
 RUN mkdir -p /out && \
     go build -trimpath -tags netgo -ldflags='-s -w' \
-        -o /out/azul-plugin-retroindexer . && \
-    go build -trimpath -tags netgo -ldflags='-s -w' \
-        -o /out/azul-index ./cmd
+        -o /out/azul-plugin-retroindexer .
 
 RUN install -Dm755 .build/bin/bgindex /go/bin/bgindex
 
@@ -56,7 +53,6 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /out/azul-plugin-retroindexer /usr/local/bin/azul-plugin-retroindexer
-COPY --from=builder /out/azul-index /usr/local/bin/azul-index
 COPY --from=builder /go/bin/bgindex /usr/local/bin/bgindex
 
 ARG UID=21000

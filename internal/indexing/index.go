@@ -226,6 +226,33 @@ func (p *Pipeline) Generate(ctx context.Context, dir string) (string, error) {
 		}
 		return "", nil // another pass will pick up split directories
 	}
+	// A new index can occupy considerable space while its source binaries
+	// remain on the PVC. Avoid repeatedly attempting the build when there is
+	// insufficient working space; this is a temporary condition, not a broken
+	// input batch, so do not update the persistent failure marker.
+	if p.Config.MinFreeBytes > 0 {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return "", err
+		}
+		var inputSize int64
+		for _, entry := range entries {
+			if !entry.IsDir() && shaName.MatchString(entry.Name()) {
+				info, err := entry.Info()
+				if err != nil {
+					return "", err
+				}
+				inputSize += info.Size()
+			}
+		}
+		available, err := availableBytes(p.stateDir())
+		if err != nil {
+			return "", fmt.Errorf("check index PVC free space: %w", err)
+		}
+		if available < inputSize+p.Config.MinFreeBytes {
+			return "", fmt.Errorf("insufficient free PVC space to build index %s: available %d, estimated workspace %d, reserve %d bytes", dir, available, inputSize, p.Config.MinFreeBytes)
+		}
+	}
 	if err := os.WriteFile(p.lastAttempt(), []byte(dir), 0664); err != nil {
 		return "", err
 	}

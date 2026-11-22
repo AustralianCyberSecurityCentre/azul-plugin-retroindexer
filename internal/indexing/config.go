@@ -14,6 +14,7 @@ type Config struct {
 	Name            string
 	StreamLabels    map[string]bool
 	MaxBytes        int64
+	MinFreeBytes    int64
 	Timeout         time.Duration
 	Periodic        time.Duration
 	Poll            time.Duration
@@ -54,6 +55,11 @@ func FromEnv() (Config, error) {
 		return c, err
 	}
 	c.MaxBytes = max
+	minFree, err := parseInt("RETROINDEXER_MIN_FREE_BYTES", 5*1024*1024*1024)
+	if err != nil {
+		return c, err
+	}
+	c.MinFreeBytes = minFree
 	timeout, err := parseInt("RETROINDEXER_TIMEOUT_MINUTES", 60)
 	if err != nil {
 		return c, err
@@ -75,7 +81,7 @@ func FromEnv() (Config, error) {
 	if c.Name == "" || strings.ContainsAny(c.Name, "/\\.") {
 		return c, fmt.Errorf("unsafe indexer name %q", c.Name)
 	}
-	if c.MaxBytes < 4 || c.Timeout <= 0 || c.Poll <= 0 {
+	if c.MaxBytes < 4 || c.MinFreeBytes < 0 || c.Timeout <= 0 || c.Poll <= 0 {
 		return c, fmt.Errorf("invalid max bytes, timeout or poll interval")
 	}
 	return c, nil

@@ -123,7 +123,7 @@ func New(s Settings) (*Publisher, error) {
 }
 
 // ParseLocation converts a logical prefix to the two components expected by
-// Bedrock's FileStorage interface. The writer and CLI MUST use the same value.
+// Bedrock's FileStorage interface. The writer and Retrohunt reader MUST use the same value.
 // The default is retrohunt/indices for compatibility with Retrohunt's reader.
 func ParseLocation(prefix string) (string, string, error) {
 	if prefix == "" {
@@ -143,7 +143,7 @@ func ParseLocation(prefix string) (string, string, error) {
 
 // UploadFile publishes an immutable, content-addressed index followed by a
 // ready marker. Retrohunt lists only ready markers and verifies SHA-256 on fetch.
-// Both the automatic publisher and azul-index CLI use the same protocol.
+// Retrohunt uses the same published .bgi/.ready protocol via its Python storage shim.
 func (p *Publisher) UploadFile(path, processor string) (string, error) {
 	if !strings.HasSuffix(strings.ToLower(path), ".bgi") {
 		return "", fmt.Errorf("not a .bgi index: %s", path)
