@@ -26,10 +26,18 @@ type Metadata struct {
 	StreamLabel  string  `json:"stream_label"`
 	StreamSource string  `json:"stream_source"`
 	JobID        *string `json:"job_id,omitempty"`
+	FileFormat   string  `json:"file_format,omitempty"`
+	Synthetic    bool    `json:"synthetic,omitempty"`
 }
 
 func (m Metadata) Format() string {
 	out := "stream_label=" + m.StreamLabel + ",stream_source=" + m.StreamSource
+	if m.Synthetic {
+		out += ",synthetic=true"
+	}
+	if m.FileFormat != "" {
+		out += ",file_format=" + m.FileFormat
+	}
 	if m.JobID != nil {
 		out += ",job_id=" + *m.JobID
 	}
@@ -40,6 +48,9 @@ func validMetadata(m Metadata) error {
 		if s == "" || strings.ContainsAny(s, ",\n\r=") {
 			return fmt.Errorf("invalid metadata component %q", s)
 		}
+	}
+	if strings.ContainsAny(m.FileFormat, ",\n\r=") {
+		return errors.New("invalid file format")
 	}
 	if m.JobID != nil && strings.ContainsAny(*m.JobID, ",\n\r=") {
 		return errors.New("invalid job id")
@@ -71,21 +82,47 @@ func (p *Pipeline) stateDir() string { return filepath.Join(p.base(), "state") }
 func (p *Pipeline) lastAttempt() string {
 	return filepath.Join(p.stateDir(), "last_attempted_dir.state")
 }
+
+// CacheBytes totals all active partitions, including legacy files from an older layout.
 func (p *Pipeline) CacheBytes() (int64, error) {
-	entries, err := os.ReadDir(p.cacheDir())
+	var sum int64
+	err := filepath.WalkDir(p.cacheDir(), func(path string, e os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if e.IsDir() || strings.HasSuffix(e.Name(), metaSuffix) || strings.HasPrefix(e.Name(), ".") {
+			return nil
+		}
+		if !shaName.MatchString(e.Name()) {
+			return nil
+		}
+		st, err := e.Info()
+		if err != nil {
+			return err
+		}
+		sum += st.Size()
+		return nil
+	})
+	return sum, err
+}
+
+func cacheBytesIn(dir string) (int64, error) {
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
 	if err != nil {
 		return 0, err
 	}
 	var sum int64
 	for _, e := range entries {
-		if e.IsDir() || strings.HasSuffix(e.Name(), metaSuffix) || strings.HasPrefix(e.Name(), ".") {
-			continue
+		if !e.IsDir() && shaName.MatchString(e.Name()) {
+			st, err := e.Info()
+			if err != nil {
+				return 0, err
+			}
+			sum += st.Size()
 		}
-		st, err := e.Info()
-		if err != nil {
-			return 0, err
-		}
-		sum += st.Size()
 	}
 	return sum, nil
 }
@@ -162,19 +199,25 @@ func (p *Pipeline) AddStream(r io.Reader, m Metadata) (bool, error) {
 		return false, fmt.Errorf("stream size %d not in [%d,%d]", size, MinDataSize, p.Config.MaxBytes)
 	}
 	name := hex.EncodeToString(h.Sum(nil))
-	dest := filepath.Join(p.cacheDir(), name)
+	// Each partition accumulates independently; no cross-format index is produced.
+	part := partitionFor(m, size)
+	activeDir := p.partitionCacheDir(part)
+	if err := os.MkdirAll(activeDir, 02775); err != nil {
+		return false, err
+	}
+	dest := filepath.Join(activeDir, name)
 	if _, err := os.Stat(dest); err == nil {
 		return false, nil
 	} else if !os.IsNotExist(err) {
 		return false, err
 	}
-	cached, err := p.CacheBytes()
+	cached, err := cacheBytesIn(activeDir)
 	if err != nil {
 		return false, err
 	}
 	// Rotate the existing batch before admitting a file that would exceed the limit.
 	if cached+size > p.Config.MaxBytes && cached > 0 {
-		if err := p.rotateCache(); err != nil {
+		if err := p.rotatePartition(activeDir); err != nil {
 			return false, err
 		}
 	}
@@ -185,7 +228,7 @@ func (p *Pipeline) AddStream(r io.Reader, m Metadata) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	metaTmp, err := os.CreateTemp(p.cacheDir(), ".meta-")
+	metaTmp, err := os.CreateTemp(activeDir, ".meta-")
 	if err != nil {
 		if removeErr := os.Remove(dest); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 			bedSet.Logger.Error().Err(removeErr).Msg("failed to remove destination file")
@@ -215,10 +258,10 @@ func (p *Pipeline) AddStream(r io.Reader, m Metadata) (bool, error) {
 	}
 	// Rotate immediately at the threshold; a subsequent stream is not required.
 	// Metadata has already been atomically written, so the ready batch is complete.
-	if cachedNow, err := p.CacheBytes(); err != nil {
+	if cachedNow, err := cacheBytesIn(activeDir); err != nil {
 		return true, err
 	} else if cachedNow >= p.Config.MaxBytes {
-		if err := p.rotateCache(); err != nil {
+		if err := p.rotatePartition(activeDir); err != nil {
 			return true, err
 		}
 	}
@@ -246,35 +289,117 @@ func (p *Pipeline) nextReadyDir() (string, error) {
 	return filepath.Join(parent, strconv.Itoa(n+1)), nil
 }
 
-// rotateCache atomically moves the active cache to a numbered ready directory.
-func (p *Pipeline) rotateCache() error {
-	bytes, err := p.CacheBytes()
-	if err != nil {
+// rotatePartition atomically moves one homogeneous staging directory into the
+// existing dated ready-batch namespace, preserving old index discovery logic.
+func (p *Pipeline) rotatePartition(activeDir string) error {
+	bytes, err := cacheBytesIn(activeDir)
+	if err != nil || bytes == 0 {
 		return err
 	}
-	if bytes == 0 {
-		return nil
-	}
-	// BigGrep needs at least two input entries. Preserve the original
-	// periodic behaviour for all single-binary batches (including size-triggered
-	// rotations) by adding a synthetic second entry to the batch.
-	if err := p.addSingleBatchDummy(); err != nil {
+	if err := p.addSingleBatchDummy(activeDir); err != nil {
 		return err
 	}
 	ready, err := p.nextReadyDir()
 	if err != nil {
 		return err
 	}
-	if err := os.Rename(p.cacheDir(), ready); err != nil {
+	if err := os.Rename(activeDir, ready); err != nil {
 		return err
 	}
-	return os.MkdirAll(p.cacheDir(), 02775)
+	return os.MkdirAll(activeDir, 02775)
 }
 
-// addSingleBatchDummy ensures the BigGrep builder gets two input entries.
-// The dummy is deterministic and is never added when two real files are present.
-func (p *Pipeline) addSingleBatchDummy() error {
+// rotateCache flushes all partitions; legacy flat-cache content is also kept.
+func (p *Pipeline) rotateCache() error {
+	groups, err := os.ReadDir(p.cacheDir())
+	if err != nil {
+		return err
+	}
+	// Rotate legacy flat input as a separate batch during an upgrade.
+	if bytes, err := cacheBytesIn(p.cacheDir()); err != nil {
+		return err
+	} else if bytes > 0 {
+		if err := p.rotateLegacyCache(); err != nil {
+			return err
+		}
+	}
+	for _, group := range groups {
+		if !group.IsDir() {
+			continue
+		}
+		sizes, err := os.ReadDir(filepath.Join(p.cacheDir(), group.Name()))
+		if err != nil {
+			return err
+		}
+		for _, size := range sizes {
+			if !size.IsDir() {
+				continue
+			}
+			if err := p.rotatePartition(filepath.Join(p.cacheDir(), group.Name(), size.Name())); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (p *Pipeline) rotateLegacyCache() error {
+	// Move legacy files into a private staging directory, then publish the
+	// completed batch with one rename. Never expose a half-migrated ready dir.
+	if err := p.addSingleBatchDummy(p.cacheDir()); err != nil {
+		return err
+	}
+	ready, err := p.nextReadyDir()
+	if err != nil {
+		return err
+	}
+	staging, err := os.MkdirTemp(filepath.Dir(ready), ".legacy-")
+	if err != nil {
+		return err
+	}
+	// Roll back if any move fails; this avoids stranding inputs in a hidden
+	// directory that the regular indexing loop cannot discover.
+	published := false
+	defer func() {
+		if published {
+			return
+		}
+		files, readErr := os.ReadDir(staging)
+		if readErr != nil {
+			bedSet.Logger.Error().Err(readErr).Msg("cannot inspect failed legacy staging batch")
+			return
+		}
+		for _, file := range files {
+			if err := os.Rename(filepath.Join(staging, file.Name()), filepath.Join(p.cacheDir(), file.Name())); err != nil {
+				bedSet.Logger.Error().Err(err).Msg("cannot restore failed legacy cache batch")
+			}
+		}
+		if err := os.Remove(staging); err != nil {
+			bedSet.Logger.Error().Err(err).Msg("failed to remove legacy staging directory")
+		}
+	}()
 	entries, err := os.ReadDir(p.cacheDir())
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || (!shaName.MatchString(entry.Name()) && !strings.HasSuffix(entry.Name(), metaSuffix)) {
+			continue
+		}
+		if err := os.Rename(filepath.Join(p.cacheDir(), entry.Name()), filepath.Join(staging, entry.Name())); err != nil {
+			return fmt.Errorf("move legacy cache file to %s: %w", staging, err)
+		}
+	}
+	if err := os.Rename(staging, ready); err != nil {
+		return fmt.Errorf("publish legacy batch %s: %w", staging, err)
+	}
+	published = true
+	return nil
+}
+
+// addSingleBatchDummy satisfies BigGrep's two-file minimum within a partition.
+func (p *Pipeline) addSingleBatchDummy(dir string) error {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return err
 	}
@@ -290,20 +415,19 @@ func (p *Pipeline) addSingleBatchDummy() error {
 	dummy := []byte("dummy-file")
 	digest := sha256.Sum256(dummy)
 	name := hex.EncodeToString(digest[:])
-	dataPath := filepath.Join(p.cacheDir(), name)
+	dataPath := filepath.Join(dir, name)
 	if _, err := os.Stat(dataPath); err == nil {
-		// The real content happens to equal the synthetic marker.
 		dummy = []byte("dummy-file-2")
 		digest = sha256.Sum256(dummy)
 		name = hex.EncodeToString(digest[:])
-		dataPath = filepath.Join(p.cacheDir(), name)
+		dataPath = filepath.Join(dir, name)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	if err := os.WriteFile(dataPath, dummy, 0664); err != nil {
 		return err
 	}
-	meta, err := json.Marshal(Metadata{StreamLabel: "content", StreamSource: "testing"})
+	meta, err := json.Marshal(Metadata{StreamLabel: "content", StreamSource: "testing", Synthetic: true})
 	if err != nil {
 		return err
 	}
@@ -311,7 +435,11 @@ func (p *Pipeline) addSingleBatchDummy() error {
 }
 
 // Flush stages the current cache as an ordinary size-based index (useful for shutdown/manual tests).
-func (p *Pipeline) Flush() error { return p.rotateCache() }
+func (p *Pipeline) Flush() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.rotateCache()
+}
 
 // PeriodicCopy flushes the active cache as an ordinary ready batch.
 // The name is retained for compatibility with existing callers. Unlike the

@@ -88,6 +88,11 @@ func (p *Pipeline) SyncUploads(target string, upload func(string) error, keepLoc
 				return count, writeErr
 			}
 		} else {
+			// Keep the summary when an upload fails; remove it only after success.
+			metaPath := strings.TrimSuffix(path, ".bgi") + ".meta.json"
+			if err := os.Remove(metaPath); err != nil && !os.IsNotExist(err) {
+				return count, fmt.Errorf("remove uploaded summary %s: %w", metaPath, err)
+			}
 			if err := os.Remove(path); err != nil {
 				return count, fmt.Errorf("uploaded but could not remove local index %s: %w", path, err)
 			}

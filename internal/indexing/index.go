@@ -102,7 +102,8 @@ func collectInput(dir string, w io.Writer) (int, error) {
 			continue
 		}
 		dataPath := filepath.Join(dir, stem)
-		if st, err := os.Stat(dataPath); err != nil || !st.Mode().IsRegular() {
+		st, err := os.Stat(dataPath)
+		if err != nil || !st.Mode().IsRegular() {
 			continue
 		}
 		meta, err := os.ReadFile(filepath.Join(dir, name))
@@ -118,7 +119,7 @@ func collectInput(dir string, w io.Writer) (int, error) {
 			log.Printf("ignoring metadata %s: %v", name, err)
 			continue
 		}
-		if _, err := fmt.Fprintf(buf, "%s,%s\n", dataPath, m.Format()); err != nil {
+		if _, err := fmt.Fprintf(buf, "%s,%s,file_size=%d\n", dataPath, m.Format(), st.Size()); err != nil {
 			return n, err
 		}
 		n++
@@ -286,6 +287,13 @@ func (p *Pipeline) Generate(ctx context.Context, dir string) (string, error) {
 		return "", err
 	}
 
+	// Derive a conservative summary from the exact input passed to BigGrep.
+	// A failure here must not produce a misleading sidecar.
+	summary, err := summarizeInput(input.Name())
+	if err != nil {
+		return "", fmt.Errorf("summarize index input: %w", err)
+	}
+
 	indexBase := p.nextIndexBase()
 
 	// All indexes (including periodic snapshots) must have unique names.
@@ -316,7 +324,44 @@ func (p *Pipeline) Generate(ctx context.Context, dir string) (string, error) {
 		return "", fmt.Errorf("bgindex failed (%v): %s", err, string(out))
 	}
 	final := indexBase + ".bgi"
+	// Prepare the metadata before exposing the completed index. A failed
+	// sidecar write must not leave a publishable index without its bounds.
+	metaPath := strings.TrimSuffix(final, ".bgi") + ".meta.json"
+	metadata, err := json.MarshalIndent(summary, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	metadata = append(metadata, '\n')
+	metaTmp, err := os.CreateTemp(p.bgiDir(), ".index-summary-*")
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		if err := os.Remove(metaTmp.Name()); err != nil && !errors.Is(err, os.ErrNotExist) {
+			bedSet.Logger.Error().Err(err).Msg("failed to remove temporary metadata")
+		}
+	}()
+	if _, err := metaTmp.Write(metadata); err != nil {
+		if closeErr := metaTmp.Close(); closeErr != nil {
+			bedSet.Logger.Error().Err(closeErr).Msg("failed to close temporary metadata")
+		}
+		return "", err
+	}
+	if err := metaTmp.Sync(); err != nil {
+		if closeErr := metaTmp.Close(); closeErr != nil {
+			bedSet.Logger.Error().Err(closeErr).Msg("failed to close temporary metadata")
+		}
+		return "", err
+	}
+	if err := metaTmp.Close(); err != nil {
+		return "", err
+	}
+	if err := os.Rename(metaTmp.Name(), metaPath); err != nil {
+		return "", err
+	}
+	// Publish the index last: upload discovery only considers .bgi files.
 	if err := os.Rename(hidden+".bgi", final); err != nil {
+		_ = os.Remove(metaPath)
 		return "", err
 	}
 	// Do not delete originals until successful output exists.

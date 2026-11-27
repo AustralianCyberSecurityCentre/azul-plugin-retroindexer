@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -84,7 +85,20 @@ func HashFile(path string) (string, int64, error) {
 //
 // Index objects are named by their SHA-256 digest rather than a mutable path.
 // This protects running hunts from a writer replacing an index underneath them.
+//
+// Put retains the original index-only API for legacy index producers.
 func (m Manager) Put(path string) (string, error) {
+	return m.PutWithMetadata(path, "")
+}
+
+// PutWithMetadata optionally publishes a JSON summary as <sha256>.meta.json.
+// When present, the summary is uploaded after index content and before .ready.
+// A repeated publication can repair a missing summary without uploading the index.
+// Legacy indexes without
+// sidecars remain searchable, and consumers must treat missing metadata as
+// unknown rather than as grounds for excluding an index.
+func (m Manager) PutWithMetadata(path, summaryPath string) (string, error) {
+
 	source, label := m.location()
 	id, size, err := HashFile(path)
 	if err != nil {
@@ -101,9 +115,52 @@ func (m Manager) Put(path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("check publication: %w", err)
 	}
+	// Optional metadata is bound to the immutable index content hash.
+	var sidecar []byte
+	if summaryPath != "" {
+		if raw, readErr := os.ReadFile(summaryPath); readErr == nil {
+			var doc struct {
+				SchemaVersion int    `json:"schema_version"`
+				FileCount     int64  `json:"file_count"`
+				MinFileSize   int64  `json:"min_file_size"`
+				MaxFileSize   int64  `json:"max_file_size"`
+				IndexSHA256   string `json:"index_sha256"`
+			}
+			if err := json.Unmarshal(raw, &doc); err != nil {
+				return "", fmt.Errorf("parse index summary: %w", err)
+			}
+			if (doc.SchemaVersion != 1 && doc.SchemaVersion != 2) || doc.FileCount <= 0 || doc.MinFileSize < 0 || doc.MaxFileSize < doc.MinFileSize || (doc.IndexSHA256 != "" && doc.IndexSHA256 != id) {
+				return "", errors.New("invalid index summary")
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(raw, &fields); err != nil {
+				return "", err
+			}
+			fields["index_sha256"], _ = json.Marshal(id)
+			sidecar, err = json.Marshal(fields)
+			if err != nil {
+				return "", err
+			}
+		} else if !errors.Is(readErr, os.ErrNotExist) {
+			return "", readErr
+		}
+	}
 	if ready {
+		if len(sidecar) > 0 {
+			// Retry a missing sidecar even if an older upload already has .ready.
+			metaReady, err := m.Storage.Exists(source, label, id+".meta.json")
+			if err != nil {
+				return "", err
+			}
+			if !metaReady {
+				if err := m.Storage.Put(source, label, id+".meta.json", io.NopCloser(strings.NewReader(string(sidecar))), int64(len(sidecar))); err != nil {
+					return "", fmt.Errorf("upload index metadata: %w", err)
+				}
+			}
+		}
 		return id, nil
-	} // A completed content-addressed upload is immutable.
+	}
+
 	file, err := os.Open(path)
 	if err != nil {
 		return "", err
@@ -117,6 +174,18 @@ func (m Manager) Put(path string) (string, error) {
 	}
 	if closeErr != nil {
 		return "", closeErr
+	}
+	if len(sidecar) > 0 {
+		// Retry a missing sidecar even if an older upload already has .ready.
+		metaReady, err := m.Storage.Exists(source, label, id+".meta.json")
+		if err != nil {
+			return "", err
+		}
+		if !metaReady {
+			if err := m.Storage.Put(source, label, id+".meta.json", io.NopCloser(strings.NewReader(string(sidecar))), int64(len(sidecar))); err != nil {
+				return "", fmt.Errorf("upload index metadata: %w", err)
+			}
+		}
 	}
 	// The marker is small and only created after the object upload succeeded.
 	// Readers additionally verify its content and the complete object digest.

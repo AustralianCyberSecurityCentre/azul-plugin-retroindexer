@@ -153,7 +153,7 @@ func (p *Publisher) UploadFile(path, processor string) (string, error) {
 		return "", err
 	}
 	manager := indexstorage.Manager{Storage: p.backend, Source: source, Label: label}
-	id, err := manager.Put(path)
+	id, err := manager.PutWithMetadata(path, strings.TrimSuffix(path, ".bgi")+".meta.json")
 	if err != nil {
 		return "", err
 	}

@@ -75,14 +75,28 @@ cat > "${base}.bgi"
 		t.Fatalf("indexed %d err %v", n, err)
 	}
 	files, err := os.ReadDir(p.bgiDir())
-	if err != nil || len(files) != 1 {
-		t.Fatalf("indexes: %v %v", files, err)
+	if err != nil || len(files) != 2 {
+		t.Fatalf("expected index and summary: %v %v", files, err)
 	}
-	data, err := os.ReadFile(filepath.Join(p.bgiDir(), files[0].Name()))
+	var indexName string
+	for _, f := range files {
+		if strings.HasSuffix(f.Name(), ".bgi") {
+			indexName = f.Name()
+		}
+	}
+	if indexName == "" {
+		t.Fatal("missing generated index")
+	}
+	summaryPath := filepath.Join(p.bgiDir(), strings.TrimSuffix(indexName, ".bgi")+".meta.json")
+	summaryData, err := os.ReadFile(summaryPath)
+	if err != nil || !bytes.Contains(summaryData, []byte(`"schema_version": 2`)) {
+		t.Fatalf("generated summary missing or invalid: %s %v", summaryData, err)
+	}
+	data, err := os.ReadFile(filepath.Join(p.bgiDir(), indexName))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(data), "stream_label=content,stream_source=testing") || !strings.Contains(string(data), "\n") {
+	if !strings.Contains(string(data), "stream_label=content,stream_source=testing") || !strings.Contains(string(data), "file_size=") || !strings.Contains(string(data), "\n") {
 		t.Fatalf("unexpected BigGrep input: %s", data)
 	}
 	ready, _ := p.ReadyDirs()
@@ -295,8 +309,17 @@ func TestPeriodicIndexesUseDistinctNames(t *testing.T) {
 		}
 	}
 	entries, err := os.ReadDir(p.bgiDir())
-	if err != nil || len(entries) != 2 || entries[0].Name() == entries[1].Name() {
-		t.Fatalf("periodic indexes overwritten: entries=%v err=%v", entries, err)
+	if err != nil || len(entries) != 4 {
+		t.Fatalf("expected two indexes and two summaries: entries=%v err=%v", entries, err)
+	}
+	var indexCount int
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".bgi") {
+			indexCount++
+		}
+	}
+	if indexCount != 2 {
+		t.Fatalf("expected two distinct indexes, got %d", indexCount)
 	}
 }
 

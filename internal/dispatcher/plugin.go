@@ -58,7 +58,15 @@ func (p *IngestPlugin) Execute(ctx context.Context, job *plugin.Job, input *plug
 			input.Logger.Error().Err(err).Msg("Failed to close file.")
 		}
 	}()
-	added, err := p.Pipeline.AddStream(f, indexing.Metadata{StreamLabel: "content", StreamSource: src.Source.Name})
+	// Prefer the content datastream's identification over the event-wide format.
+	format := src.Entity.FileFormat
+	for _, stream := range src.Entity.Datastreams {
+		if string(stream.Label) == "content" && stream.FileFormat != "" {
+			format = stream.FileFormat
+			break
+		}
+	}
+	added, err := p.Pipeline.AddStream(f, indexing.Metadata{StreamLabel: "content", StreamSource: src.Source.Name, FileFormat: format})
 	if err != nil {
 		return plugin.NewPluginError(plugin.ErrorException, "Failed to stage index content", fmt.Sprintf("%v", err))
 	}
