@@ -15,7 +15,7 @@ import (
 type IngestPlugin struct{ Pipeline *indexing.Pipeline }
 
 func (p *IngestPlugin) GetName() string    { return "RetroindexerIngestor" }
-func (p *IngestPlugin) GetVersion() string { return "0.1.0" }
+func (p *IngestPlugin) GetVersion() string { return "0.2.0" }
 func (p *IngestPlugin) GetDescription() string {
 	return "Ingest binary content into Retrohunt BigGrep index batches"
 }
