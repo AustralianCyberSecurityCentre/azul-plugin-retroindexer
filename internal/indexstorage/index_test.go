@@ -135,3 +135,109 @@ func ioNopCloser(b []byte) *nopCloser { return &nopCloser{bytes.NewReader(b)} }
 type nopCloser struct{ *bytes.Reader }
 
 func (*nopCloser) Close() error { return nil }
+
+// TestPartitionedPublication verifies that object prefixes are queryable
+// without downloading an index and that legacy indexes remain discoverable.
+func TestPartitionedPublication(t *testing.T) {
+	backend, err := store.NewLocalStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := Manager{Storage: backend}
+	input := filepath.Join(t.TempDir(), "pe.bgi")
+	if err := os.WriteFile(input, []byte("partitioned index"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	summaryPath := strings.TrimSuffix(input, ".bgi") + ".meta.json"
+	summary := `{"schema_version":2,"file_count":1,"min_file_size":1024,"max_file_size":1024,"file_type_group":"windows","size_class":"lt1m"}`
+	if err := os.WriteFile(summaryPath, []byte(summary), 0600); err != nil {
+		t.Fatal(err)
+	}
+	id, err := manager.PutWithMetadata(input, summaryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, suffix := range []string{".bgi", ".meta.json", ".ready"} {
+		found, err := backend.Exists(defaultSource, defaultLabel, "windows/lt1m/"+id+suffix)
+		if err != nil || !found {
+			t.Fatalf("missing partition object %s: %v", suffix, err)
+		}
+	}
+	entries, err := manager.ListEntries(context.Background())
+	if err != nil || len(entries) != 1 || entries[0].Prefix != "windows/lt1m" {
+		t.Fatalf("unexpected entries: %+v, %v", entries, err)
+	}
+	if err := manager.FetchEntry(entries[0], filepath.Join(t.TempDir(), "download.bgi")); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Fetch(id, filepath.Join(t.TempDir(), "legacy-api.bgi")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRejectInvalidPartition(t *testing.T) {
+	backend, err := store.NewLocalStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := Manager{Storage: backend}
+	input := filepath.Join(t.TempDir(), "test.bgi")
+	if err := os.WriteFile(input, []byte("test"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	meta := strings.TrimSuffix(input, ".bgi") + ".meta.json"
+	if err := os.WriteFile(meta, []byte(`{"schema_version":2,"file_count":1,"min_file_size":1,"max_file_size":1,"file_type_group":"../evil","size_class":"lt1m"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.PutWithMetadata(input, meta); err == nil {
+		t.Fatal("unsafe partition accepted")
+	}
+}
+
+func TestListPartitionExcludesOtherPrefixes(t *testing.T) {
+	backend, err := store.NewLocalStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := Manager{Storage: backend}
+	for _, part := range []string{"windows/lt1m", "elf/lt1m", "windows/1m-10m"} {
+		ready := strings.Repeat("a", 64) + ".ready"
+		content := []byte(strings.Repeat("a", 64) + "\n")
+		if err := backend.Put(defaultSource, defaultLabel, part+"/"+ready, ioNopCloser(content), int64(len(content))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, err := manager.ListPartition(context.Background(), "windows", "lt1m")
+	if err != nil || len(entries) != 1 || entries[0].Prefix != "windows/lt1m" {
+		t.Fatalf("unexpected partition listing %+v: %v", entries, err)
+	}
+	if _, err := manager.ListPartition(context.Background(), "../bad", "lt1m"); err == nil {
+		t.Fatal("invalid partition accepted")
+	}
+}
+
+// TestRelativeIndexKey covers both key formats returned by Bedrock backends.
+func TestRelativeIndexKey(t *testing.T) {
+	const base = "retrohunt/indices/"
+	const filename = "windows/lt1m/" + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" + ".ready"
+	for _, tc := range []struct {
+		name string
+		key  string
+		want string
+		ok   bool
+	}{
+		{name: "cloud partition", key: base + filename, want: filename, ok: true},
+		{name: "filesystem partition", key: "/tmp/object-store/" + base + filename, want: filename, ok: true},
+		{name: "cloud legacy", key: base + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.ready", want: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.ready", ok: true},
+		{name: "filesystem legacy", key: "/tmp/object-store/" + base + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.ready", want: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.ready", ok: true},
+		{name: "wrong namespace", key: "another/indices/" + filename, ok: false},
+		{name: "partial namespace", key: "/tmp/notretrohunt/indices/" + filename, ok: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := relativeIndexKey(tc.key, base)
+			if got != tc.want || ok != tc.ok {
+				t.Fatalf("relativeIndexKey(%q) = %q, %t; want %q, %t", tc.key, got, ok, tc.want, tc.ok)
+			}
+		})
+	}
+}

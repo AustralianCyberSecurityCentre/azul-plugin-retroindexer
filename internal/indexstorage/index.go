@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -31,6 +32,38 @@ const (
 )
 
 var validID = regexp.MustCompile(`^[a-f0-9]{64}$`)
+
+var validFileTypes = map[string]bool{
+	"windows": true, "elf": true, "macho": true, "mobile": true,
+	"bytecode": true, "document": true, "archive": true, "script": true,
+	"image": true, "audio": true, "video": true, "executable-other": true,
+	"unknown": true, "other": true, "mixed": true,
+}
+var validSizeClasses = map[string]bool{
+	"lt1m": true, "1m-10m": true, "10m-100m": true, "gte100m": true, "mixed": true,
+}
+
+// Entry identifies a committed index and its storage prefix. Use the full
+// object key when downloading: IDs alone cannot identify a partition.
+type Entry struct {
+	ID     string
+	Prefix string
+}
+
+func (e Entry) key(suffix string) string {
+	if e.Prefix == "" {
+		return e.ID + suffix
+	}
+	return e.Prefix + "/" + e.ID + suffix
+}
+
+func partitionPrefix(fileType, sizeClass string) (string, error) {
+	if !validFileTypes[fileType] || !validSizeClasses[sizeClass] ||
+		(fileType == "mixed") != (sizeClass == "mixed") {
+		return "", fmt.Errorf("invalid index partition %q/%q", fileType, sizeClass)
+	}
+	return fileType + "/" + sizeClass, nil
+}
 
 // Manager stores content-addressed indexes using Bedrock's FileStorage interface.
 // IDs are SHA-256 digests, so publication can be safely retried.
@@ -110,27 +143,37 @@ func (m Manager) PutWithMetadata(path, summaryPath string) (string, error) {
 	if !strings.HasSuffix(strings.ToLower(path), ".bgi") {
 		return "", errors.New("input must have a .bgi extension")
 	}
-	object := id + ".bgi"
-	ready, err := m.Storage.Exists(source, label, id+markerSuffix)
-	if err != nil {
-		return "", fmt.Errorf("check publication: %w", err)
-	}
-	// Optional metadata is bound to the immutable index content hash.
+	entry := Entry{ID: id}
+	// Metadata determines the partition; legacy indexes retain their flat layout.
+	// Do not advertise a partition without a valid sidecar.
 	var sidecar []byte
 	if summaryPath != "" {
-		if raw, readErr := os.ReadFile(summaryPath); readErr == nil {
+		raw, readErr := os.ReadFile(summaryPath)
+		if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+			return "", readErr
+		}
+		if readErr == nil {
 			var doc struct {
 				SchemaVersion int    `json:"schema_version"`
 				FileCount     int64  `json:"file_count"`
 				MinFileSize   int64  `json:"min_file_size"`
 				MaxFileSize   int64  `json:"max_file_size"`
 				IndexSHA256   string `json:"index_sha256"`
+				FileTypeGroup string `json:"file_type_group"`
+				SizeClass     string `json:"size_class"`
 			}
 			if err := json.Unmarshal(raw, &doc); err != nil {
 				return "", fmt.Errorf("parse index summary: %w", err)
 			}
 			if (doc.SchemaVersion != 1 && doc.SchemaVersion != 2) || doc.FileCount <= 0 || doc.MinFileSize < 0 || doc.MaxFileSize < doc.MinFileSize || (doc.IndexSHA256 != "" && doc.IndexSHA256 != id) {
 				return "", errors.New("invalid index summary")
+			}
+			if doc.SchemaVersion == 2 {
+				prefix, err := partitionPrefix(doc.FileTypeGroup, doc.SizeClass)
+				if err != nil {
+					return "", err
+				}
+				entry.Prefix = prefix
 			}
 			var fields map[string]json.RawMessage
 			if err := json.Unmarshal(raw, &fields); err != nil {
@@ -141,19 +184,22 @@ func (m Manager) PutWithMetadata(path, summaryPath string) (string, error) {
 			if err != nil {
 				return "", err
 			}
-		} else if !errors.Is(readErr, os.ErrNotExist) {
-			return "", readErr
 		}
+	}
+	object := entry.key(".bgi")
+	ready, err := m.Storage.Exists(source, label, entry.key(markerSuffix))
+	if err != nil {
+		return "", fmt.Errorf("check publication: %w", err)
 	}
 	if ready {
 		if len(sidecar) > 0 {
 			// Retry a missing sidecar even if an older upload already has .ready.
-			metaReady, err := m.Storage.Exists(source, label, id+".meta.json")
+			metaReady, err := m.Storage.Exists(source, label, entry.key(".meta.json"))
 			if err != nil {
 				return "", err
 			}
 			if !metaReady {
-				if err := m.Storage.Put(source, label, id+".meta.json", io.NopCloser(strings.NewReader(string(sidecar))), int64(len(sidecar))); err != nil {
+				if err := m.Storage.Put(source, label, entry.key(".meta.json"), io.NopCloser(strings.NewReader(string(sidecar))), int64(len(sidecar))); err != nil {
 					return "", fmt.Errorf("upload index metadata: %w", err)
 				}
 			}
@@ -177,12 +223,12 @@ func (m Manager) PutWithMetadata(path, summaryPath string) (string, error) {
 	}
 	if len(sidecar) > 0 {
 		// Retry a missing sidecar even if an older upload already has .ready.
-		metaReady, err := m.Storage.Exists(source, label, id+".meta.json")
+		metaReady, err := m.Storage.Exists(source, label, entry.key(".meta.json"))
 		if err != nil {
 			return "", err
 		}
 		if !metaReady {
-			if err := m.Storage.Put(source, label, id+".meta.json", io.NopCloser(strings.NewReader(string(sidecar))), int64(len(sidecar))); err != nil {
+			if err := m.Storage.Put(source, label, entry.key(".meta.json"), io.NopCloser(strings.NewReader(string(sidecar))), int64(len(sidecar))); err != nil {
 				return "", fmt.Errorf("upload index metadata: %w", err)
 			}
 		}
@@ -190,42 +236,145 @@ func (m Manager) PutWithMetadata(path, summaryPath string) (string, error) {
 	// The marker is small and only created after the object upload succeeded.
 	// Readers additionally verify its content and the complete object digest.
 	marker := io.NopCloser(strings.NewReader(id + "\n"))
-	if err := m.Storage.Put(source, label, id+markerSuffix, marker, int64(len(id)+1)); err != nil {
+	if err := m.Storage.Put(source, label, entry.key(markerSuffix), marker, int64(len(id)+1)); err != nil {
 		return "", fmt.Errorf("index uploaded but publication marker failed (retry is safe): %w", err)
 	}
 	return id, nil
 }
 
-// List returns published IDs. Object listing can be streamed by providers;
-// only the short identifiers are accumulated here, not index contents.
-func (m Manager) List(ctx context.Context) ([]string, error) {
+// ListPartition lists one type/size prefix without requesting index bodies.
+// A hunt can call this for only the compatible partitions.
+func (m Manager) ListPartition(ctx context.Context, fileType, sizeClass string) ([]Entry, error) {
+	prefix, err := partitionPrefix(fileType, sizeClass)
+	if err != nil {
+		return nil, err
+	}
+	return m.listAtPrefix(ctx, prefix)
+}
+
+// ListEntries finds ready markers across legacy and partitioned locations.
+func (m Manager) ListEntries(ctx context.Context) ([]Entry, error) {
+	return m.listAtPrefix(ctx, "")
+}
+
+// relativeIndexKey handles both cloud object keys and absolute filesystem
+// paths returned by Bedrock's local store, without accepting another namespace.
+func relativeIndexKey(key, base string) (string, bool) {
+	key = filepath.ToSlash(key)
+	if strings.HasPrefix(key, base) {
+		return strings.TrimPrefix(key, base), true
+	}
+	boundary := "/" + base
+	pos := strings.LastIndex(key, boundary)
+	if pos < 0 {
+		return "", false
+	}
+	return key[pos+len(boundary):], true
+}
+
+func (m Manager) listAtPrefix(ctx context.Context, filter string) ([]Entry, error) {
 	source, label := m.location()
-	var result []string
-	for entry := range m.Storage.List(ctx, source+"/"+label+"/", "") {
-		if entry.Err != nil {
-			return nil, entry.Err
+	base := source + "/" + label + "/"
+	prefix := base
+	if filter != "" {
+		prefix += filter + "/"
+	}
+	var result []Entry
+	for object := range m.Storage.List(ctx, prefix, "") {
+		if object.Err != nil {
+			return nil, object.Err
 		}
-		if !strings.HasSuffix(entry.Key, markerSuffix) {
+		if !strings.HasSuffix(object.Key, markerSuffix) {
 			continue
 		}
-		id := strings.TrimSuffix(filepath.Base(entry.Key), markerSuffix)
-		if checkID(id) == nil {
-			result = append(result, id)
+		relative, ok := relativeIndexKey(object.Key, base)
+		if !ok {
+			continue
 		}
+		key := strings.TrimSuffix(relative, markerSuffix)
+		id := path.Base(key)
+		if checkID(id) != nil {
+			continue
+		}
+		prefix := path.Dir(key)
+		if prefix == "." {
+			prefix = ""
+		} else {
+			pieces := strings.Split(prefix, "/")
+			if len(pieces) != 2 {
+				continue
+			}
+			if _, err := partitionPrefix(pieces[0], pieces[1]); err != nil {
+				continue
+			}
+		}
+		result = append(result, Entry{ID: id, Prefix: prefix})
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	sort.Strings(result)
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Prefix != result[j].Prefix {
+			return result[i].Prefix < result[j].Prefix
+		}
+		return result[i].ID < result[j].ID
+	})
 	return result, nil
+}
+
+// List retains the older ID-only interface. For partition-aware consumers,
+// ListEntries and FetchEntry avoid ambiguous IDs and repeated discovery.
+func (m Manager) List(ctx context.Context) ([]string, error) {
+	entries, err := m.ListEntries(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(entries))
+	seen := make(map[string]bool)
+	for _, entry := range entries {
+		if !seen[entry.ID] {
+			ids = append(ids, entry.ID)
+			seen[entry.ID] = true
+		}
+	}
+	sort.Strings(ids)
+	return ids, nil
+}
+
+// Fetch resolves a legacy ID across both layouts. New readers should retain
+// the Entry returned by ListEntries and call FetchEntry directly.
+func (m Manager) Fetch(id, output string) error {
+	if err := checkID(id); err != nil {
+		return err
+	}
+	entries, err := m.ListEntries(context.Background())
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.ID == id {
+			return m.FetchEntry(entry, output)
+		}
+	}
+	return fmt.Errorf("index %s is not published", id)
 }
 
 // Fetch atomically ensures a verified local index at output. An advisory
 // filesystem lock serializes processes downloading the same index to the same
 // path, preventing redundant network transfers and partially visible files.
 // The lock file must live on a filesystem supporting flock (Linux pods do).
-func (m Manager) Fetch(id, output string) error {
+func (m Manager) FetchEntry(entry Entry, output string) error {
 	source, label := m.location()
+	id := entry.ID
+	if entry.Prefix != "" {
+		pieces := strings.Split(entry.Prefix, "/")
+		if len(pieces) != 2 {
+			return errors.New("invalid index prefix")
+		}
+		if _, err := partitionPrefix(pieces[0], pieces[1]); err != nil {
+			return err
+		}
+	}
 	if err := checkID(id); err != nil {
 		return err
 	}
@@ -257,7 +406,7 @@ func (m Manager) Fetch(id, output string) error {
 	}
 
 	// Reject unpublished objects; a writer may still be uploading their data.
-	marker, err := m.Storage.Fetch(source, label, id+markerSuffix)
+	marker, err := m.Storage.Fetch(source, label, entry.key(markerSuffix))
 	if err != nil {
 		return fmt.Errorf("index %s is not published: %w", id, err)
 	}
@@ -273,7 +422,7 @@ func (m Manager) Fetch(id, output string) error {
 		return errors.New("invalid publication marker")
 	}
 
-	data, err := m.Storage.Fetch(source, label, id+".bgi")
+	data, err := m.Storage.Fetch(source, label, entry.key(".bgi"))
 	if err != nil {
 		return fmt.Errorf("fetch index: %w", err)
 	}

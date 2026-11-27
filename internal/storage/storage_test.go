@@ -108,3 +108,27 @@ func TestParseLocation(t *testing.T) {
 		t.Fatalf("location: %s/%s %v", source, label, err)
 	}
 }
+
+func TestPublisherUsesPartitionedPrefix(t *testing.T) {
+	backend, err := store.NewLocalStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	publisher := &Publisher{backend: backend, prefix: "retrohunt/indices"}
+	index := filepath.Join(t.TempDir(), "batch.bgi")
+	if err := os.WriteFile(index, []byte("example partitioned index"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	metadata := strings.TrimSuffix(index, ".bgi") + ".meta.json"
+	raw := `{"schema_version":2,"file_count":1,"min_file_size":10,"max_file_size":10,"file_type_group":"elf","size_class":"lt1m"}`
+	if err := os.WriteFile(metadata, []byte(raw), 0600); err != nil {
+		t.Fatal(err)
+	}
+	key, err := publisher.UploadFile(index, "content")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(key, "retrohunt/indices/elf/lt1m/") {
+		t.Fatalf("unexpected key %s", key)
+	}
+}

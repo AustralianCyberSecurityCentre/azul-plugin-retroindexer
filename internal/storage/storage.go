@@ -3,6 +3,7 @@
 package storage
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -156,6 +157,26 @@ func (p *Publisher) UploadFile(path, processor string) (string, error) {
 	id, err := manager.PutWithMetadata(path, strings.TrimSuffix(path, ".bgi")+".meta.json")
 	if err != nil {
 		return "", err
+	}
+	// Resolve the partition from the same sidecar used by PutWithMetadata.
+	// Object keys are type/size/hash.bgi for v2 and flat for legacy v1.
+	summaryPath := strings.TrimSuffix(path, ".bgi") + ".meta.json"
+	raw, readErr := os.ReadFile(summaryPath)
+	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+		return "", readErr
+	}
+	if readErr == nil {
+		var summary struct {
+			SchemaVersion int    `json:"schema_version"`
+			FileTypeGroup string `json:"file_type_group"`
+			SizeClass     string `json:"size_class"`
+		}
+		if err := json.Unmarshal(raw, &summary); err != nil {
+			return "", err
+		}
+		if summary.SchemaVersion == 2 {
+			return source + "/" + label + "/" + summary.FileTypeGroup + "/" + summary.SizeClass + "/" + id + ".bgi", nil
+		}
 	}
 	return source + "/" + label + "/" + id + ".bgi", nil
 }
